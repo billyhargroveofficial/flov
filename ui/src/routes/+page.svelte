@@ -10,6 +10,15 @@
   type PillSnapshot = {
     state: State;
     errorText: string;
+    seq: number;
+  };
+  type PillStateEvent = {
+    state: State;
+    seq: number;
+  };
+  type PillErrorEvent = {
+    message: string;
+    seq: number;
   };
 
   const BAR_COUNT = 20;
@@ -21,6 +30,7 @@
     let hideTimer: ReturnType<typeof setTimeout> | undefined;
     let errorTimer: ReturnType<typeof setTimeout> | undefined;
     let transitionSeq = 0;
+    let latestBackendSeq = 0;
 
     const clearTimer = (id: ReturnType<typeof setTimeout> | undefined) => {
       if (id) clearTimeout(id);
@@ -53,6 +63,9 @@
     };
 
     const applySnapshot = (snapshot: PillSnapshot) => {
+      if (snapshot.seq < latestBackendSeq) return;
+      latestBackendSeq = snapshot.seq;
+
       if (snapshot.state === "idle") {
         pillState = "idle";
         return;
@@ -81,8 +94,10 @@
 
     let mounted = true;
     const unlisteners: Array<Promise<() => void>> = [
-      listen<State>("state-changed", (e) => {
-        const next = e.payload;
+      listen<PillStateEvent>("state-changed", (e) => {
+        if (e.payload.seq < latestBackendSeq) return;
+        latestBackendSeq = e.payload.seq;
+        const next = e.payload.state;
         clearPendingTransitions();
         if (next === "recording") {
           spectrum = Array(BAR_COUNT).fill(0);
@@ -103,9 +118,11 @@
       listen<number[]>("audio-spectrum", (e) => {
         spectrum = e.payload;
       }),
-      listen<string>("transcribe-error", (e) => {
+      listen<PillErrorEvent>("transcribe-error", (e) => {
+        if (e.payload.seq < latestBackendSeq) return;
+        latestBackendSeq = e.payload.seq;
         clearPendingTransitions();
-        errorText = e.payload;
+        errorText = e.payload.message;
         pillState = "error";
         repaintAfterDomFlush();
         // Hold the error on screen long enough to read, then morph out.

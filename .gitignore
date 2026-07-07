@@ -10,6 +10,7 @@ flov.toml
 # Bundle staging — populated by scripts/build-bundle.{ps1,sh} / dev.sh
 /src-tauri/binaries/*-x86_64-pc-windows-*.exe
 /src-tauri/binaries/*-aarch64-apple-darwin
+/src-tauri/binaries/sidecars-manifest.json
 /src-tauri/binaries/runtime/*
 !/src-tauri/binaries/runtime/.gitkeep
 !/src-tauri/binaries/.gitkeep

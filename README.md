@@ -68,7 +68,8 @@ tccutil reset Microphone com.flov.app
 ## Settings (правый клик по трею → Open Settings)
 
 - **Models** — каталог Whisper моделей (tiny / base / small / medium / large-v3-turbo)
-- **Backend** — выбор GPU sidecar (CUDA / Vulkan / Metal / CPU), Auto = первый доступный
+- **Backend** — выбор GPU sidecar (CUDA / Vulkan / Metal / CPU), Auto = первый usable
+  backend; CUDA на Windows скрывается без NVIDIA runtime (`nvcuda.dll`)
 - **Post-process** — OpenRouter API key, модель, системный промпт
 - **Hotkey** — любая комбинация (включая одиночный RCtrl)
 - **Stats** — heatmap записей по дням
@@ -146,6 +147,11 @@ brew install rust cmake node      # если их ещё нет
 На выходе: `target/release/bundle/nsis/flov_<version>_x64-setup.exe` —
 single-file installer. Whisper модель (~1.6 GB) НЕ внутри installer —
 пользователь скачивает её через Settings → Models после установки.
+
+`-SkipSidecars` переиспользует уже собранные sidecar binaries, но теперь
+требует свежий `sidecars-manifest.json` из предыдущей non-skip сборки и
+проверяет source hash + sha256 файлов. CUDA — только opt-in через
+`-IncludeCuda`; если включить CUDA и cuBLAS DLLs не найдены, сборка падает.
 
 ### macOS: .app + .dmg
 

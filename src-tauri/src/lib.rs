@@ -82,10 +82,11 @@ pub fn run() {
     tracing::info!("flov starting (Tauri)");
 
     let cfg = config::Config::load().expect("config load failed");
-    let recorder = Arc::new(
-        audio::AudioRecorder::new(cfg.audio.sample_rate, cfg.audio.device.as_deref())
-            .expect("audio init failed"),
-    );
+    let audio_device = Arc::new(Mutex::new(cfg.audio.device.clone()));
+    let audio_capture = Arc::new(audio::AudioCaptureManager::new(
+        cfg.audio.sample_rate,
+        audio_device.clone(),
+    ));
 
     // Shared mutable backend + model — written by the tray/Models window,
     // read by the Transcriber on every transcribe() call so a switch takes
@@ -156,7 +157,6 @@ pub fn run() {
     tracing::info!("hotkey: {}", initial_def.combo);
     hotkey::set_hotkey_def(initial_def);
     let hotkey_combo = Arc::new(Mutex::new(cfg.hotkey.combo.clone()));
-    let audio_device = Arc::new(Mutex::new(cfg.audio.device.clone()));
 
     let app_state = state_cmd::AppState {
         backend_choice: backend_choice.clone(),
@@ -170,7 +170,7 @@ pub fn run() {
     };
 
     let stats_for_loop = stats.clone();
-    let sample_rate_for_loop = recorder.output_sample_rate();
+    let sample_rate_for_loop = audio_capture.output_sample_rate();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -195,13 +195,17 @@ pub fn run() {
             {
                 ui::force_click_through(&window);
                 ui::set_window_alpha(&window, 0);
+                if let Err(e) = window.show() {
+                    tracing::warn!("initial pill window.show() failed: {}", e);
+                }
+                ui::force_repaint(&window);
             }
 
             tray::setup(&app_handle)?;
 
             // Spawn the recording orchestration thread; it owns the recorder
             // loop and emits state/amplitude events to the webview.
-            let recorder = recorder.clone();
+            let audio = audio_capture.clone();
             let transcriber = transcriber.clone();
             let active_mode = active_mode.clone();
             let is_recording = is_recording.clone();
@@ -219,7 +223,7 @@ pub fn run() {
             );
             recording::spawn_recording_loop(recording::RecordingRuntime {
                 app: app_for_thread,
-                recorder,
+                audio,
                 transcriber,
                 active_mode,
                 is_recording,

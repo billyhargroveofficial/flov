@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tauri::{Emitter, Manager};
 
@@ -8,7 +8,7 @@ use crate::{audio, hotkey, input, postprocess, stats, transcribe, tray, ui};
 
 pub struct RecordingRuntime {
     pub app: tauri::AppHandle,
-    pub recorder: Arc<audio::AudioRecorder>,
+    pub audio: Arc<audio::AudioCaptureManager>,
     pub transcriber: Arc<transcribe::Transcriber>,
     pub active_mode: Arc<AtomicU8>,
     pub is_recording: Arc<AtomicBool>,
@@ -17,6 +17,11 @@ pub struct RecordingRuntime {
     pub stats: Arc<stats::Stats>,
     pub sample_rate: u32,
 }
+
+const MAX_RECORDING_DURATION: Duration = Duration::from_secs(5 * 60);
+const HOTKEY_RELEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
+const WATCHDOG_ACTIVE_RESET_AFTER: Duration = Duration::from_secs(5 * 60 + 10);
 
 struct RecordingCycleGuard;
 
@@ -45,8 +50,10 @@ pub fn spawn_state_watchdog(is_recording: Arc<AtomicBool>, active_mode: Arc<Atom
         .name("flov-state-watchdog".into())
         .spawn(move || {
             let mut stuck_ticks = 0u8;
+            let mut active_ticks = 0u16;
+            let active_reset_ticks = duration_to_ticks(WATCHDOG_ACTIVE_RESET_AFTER);
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                std::thread::sleep(WATCHDOG_INTERVAL);
                 let recording = is_recording.load(Ordering::SeqCst);
                 let mode = active_mode.load(Ordering::SeqCst);
                 if recording && mode == hotkey::MODE_IDLE {
@@ -61,6 +68,22 @@ pub fn spawn_state_watchdog(is_recording: Arc<AtomicBool>, active_mode: Arc<Atom
                 } else {
                     stuck_ticks = 0;
                 }
+
+                if mode != hotkey::MODE_IDLE {
+                    active_ticks = active_ticks.saturating_add(1);
+                    if active_ticks >= active_reset_ticks {
+                        tracing::warn!(
+                            "watchdog: hotkey mode stuck active for ~{:?}, resetting",
+                            WATCHDOG_ACTIVE_RESET_AFTER
+                        );
+                        active_mode.store(hotkey::MODE_IDLE, Ordering::SeqCst);
+                        is_recording.store(false, Ordering::SeqCst);
+                        active_ticks = 0;
+                        stuck_ticks = 0;
+                    }
+                } else {
+                    active_ticks = 0;
+                }
             }
         })
         .expect("spawn watchdog thread");
@@ -74,34 +97,36 @@ pub fn spawn_webview_reloader(
     std::thread::Builder::new()
         .name("flov-webview-reloader".into())
         .spawn(move || {
-            const RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+            const RELOAD_INTERVAL: Duration = Duration::from_secs(30 * 60);
             loop {
                 std::thread::sleep(RELOAD_INTERVAL);
-                if is_recording.load(Ordering::SeqCst) {
-                    tracing::info!("webview reload skipped: recording in progress");
-                    continue;
-                }
-                if active_mode.load(Ordering::SeqCst) != hotkey::MODE_IDLE {
-                    tracing::info!("webview reload skipped: hotkey mode active");
-                    continue;
-                }
-                if ui::frontend_reload_in_progress() {
-                    tracing::info!("webview reload skipped: previous reload still pending");
-                    continue;
-                }
-                if ui::overlay_active() {
-                    tracing::info!("webview reload skipped: pill logically active");
-                    continue;
-                }
-                if !ui::overlay_quiet_for(std::time::Duration::from_secs(5)) {
-                    tracing::info!("webview reload skipped: pill was active recently");
+                let input = reload_gate_input(&is_recording, &active_mode);
+                if let Err(reason) = ui::reload_gate_decision(input) {
+                    tracing::info!("webview reload skipped: {}", reason.log_message());
                     continue;
                 }
                 let Some(window) = app.get_webview_window("main") else {
                     tracing::warn!("webview reload: main window missing");
                     continue;
                 };
-                let previous_epoch = ui::mark_frontend_reload_started();
+
+                let Some(previous_epoch) =
+                    ui::try_mark_frontend_reload_started(ui::FRONTEND_RELOAD_STALE_AFTER)
+                else {
+                    tracing::info!("webview reload skipped: previous reload still pending");
+                    continue;
+                };
+
+                let second_input = reload_gate_input(&is_recording, &active_mode);
+                if let Err(reason) = ui::activity_reload_gate_decision(second_input) {
+                    ui::mark_frontend_reload_finished();
+                    tracing::info!(
+                        "webview reload canceled before eval: {}",
+                        reason.log_message()
+                    );
+                    continue;
+                }
+
                 #[cfg(target_os = "windows")]
                 ui::set_window_alpha(&window, 0);
                 match window.eval("location.reload()") {
@@ -114,8 +139,9 @@ pub fn spawn_webview_reloader(
                             tracing::info!("webview reload completed");
                         } else {
                             tracing::warn!(
-                                "webview reload did not report ready within 10s; will wait on next show"
+                                "webview reload did not report ready within 10s; clearing stale reload lease"
                             );
+                            ui::mark_frontend_reload_finished();
                         }
                     }
                     Err(e) => {
@@ -131,7 +157,7 @@ pub fn spawn_webview_reloader(
 fn recording_loop(runtime: RecordingRuntime) {
     let RecordingRuntime {
         app,
-        recorder,
+        audio,
         transcriber,
         active_mode,
         is_recording,
@@ -157,7 +183,7 @@ fn recording_loop(runtime: RecordingRuntime) {
             emit_transcribe_error(&app, "Скачай модель: Settings → Models");
             tracing::warn!("hotkey pressed but no model is configured");
             is_recording.store(false, Ordering::SeqCst);
-            wait_for_hotkey_release(&active_mode);
+            wait_for_hotkey_release_or_reset(&active_mode);
             continue;
         }
 
@@ -168,11 +194,18 @@ fn recording_loop(runtime: RecordingRuntime) {
         let active_for_record = active_mode.clone();
         let app_for_spec = app.clone();
         let record_start = Instant::now();
-        let samples = match recorder.record_while_with_spectrum(
-            move || active_for_record.load(Ordering::SeqCst) != hotkey::MODE_IDLE,
-            move |spec| {
-                let _ = app_for_spec.emit("audio-spectrum", spec);
+        let condition_start = record_start;
+        let samples = match audio.record_while_with_spectrum(
+            move || {
+                active_for_record.load(Ordering::SeqCst) != hotkey::MODE_IDLE
+                    && condition_start.elapsed() < MAX_RECORDING_DURATION
             },
+            move |spec| {
+                if let Some(window) = app_for_spec.get_webview_window("main") {
+                    let _ = window.emit("audio-spectrum", spec);
+                }
+            },
+            MAX_RECORDING_DURATION,
         ) {
             Ok(samples) => samples,
             Err(e) => {
@@ -180,10 +213,20 @@ fn recording_loop(runtime: RecordingRuntime) {
                 emit_transcribe_error(&app, &format!("Audio error: {e:#}"));
                 tray::set_state(&app, tray::TrayState::Idle);
                 is_recording.store(false, Ordering::SeqCst);
-                wait_for_hotkey_release(&active_mode);
+                wait_for_hotkey_release_or_reset(&active_mode);
                 continue;
             }
         };
+
+        if active_mode.load(Ordering::SeqCst) != hotkey::MODE_IDLE
+            && record_start.elapsed() >= MAX_RECORDING_DURATION
+        {
+            tracing::warn!(
+                "recording reached max duration {:?}; forcing hotkey mode idle",
+                MAX_RECORDING_DURATION
+            );
+            active_mode.store(hotkey::MODE_IDLE, Ordering::SeqCst);
+        }
 
         is_recording.store(false, Ordering::SeqCst);
         tracing::info!(
@@ -231,7 +274,9 @@ fn recording_loop(runtime: RecordingRuntime) {
         let chars = raw_text.chars().count() as u64;
         let seconds = samples.len() as f64 / sample_rate as f64;
         stats.record(chars, seconds);
-        let _ = app.emit("stats-updated", ());
+        if let Some(window) = app.get_webview_window("settings") {
+            let _ = window.emit("stats-updated", ());
+        }
 
         let pp_snapshot: Option<Arc<postprocess::PostProcessor>> =
             post_processor.lock().unwrap().clone();
@@ -268,19 +313,48 @@ fn recording_loop(runtime: RecordingRuntime) {
 }
 
 fn emit_state(app: &tauri::AppHandle, state: ui::PillState) {
-    ui::set_pill_state(state);
-    let _ = app.emit("state-changed", state);
+    let seq = ui::set_pill_state(state);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit("state-changed", ui::pill_event(state, seq));
+    }
 }
 
 fn emit_transcribe_error(app: &tauri::AppHandle, message: &str) {
-    ui::set_pill_error(message);
-    let _ = app.emit("transcribe-error", message);
+    let seq = ui::set_pill_error(message);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit("transcribe-error", ui::pill_error_event(message, seq));
+    }
 }
 
-fn wait_for_hotkey_release(active_mode: &AtomicU8) {
+fn wait_for_hotkey_release_or_reset(active_mode: &AtomicU8) {
+    let start = Instant::now();
     while active_mode.load(Ordering::SeqCst) != hotkey::MODE_IDLE {
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        if start.elapsed() >= HOTKEY_RELEASE_WAIT_TIMEOUT {
+            tracing::warn!(
+                "hotkey release not observed after {:?}; forcing idle",
+                HOTKEY_RELEASE_WAIT_TIMEOUT
+            );
+            active_mode.store(hotkey::MODE_IDLE, Ordering::SeqCst);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn reload_gate_input(is_recording: &AtomicBool, active_mode: &AtomicU8) -> ui::ReloadGateInput {
+    ui::ReloadGateInput {
+        is_recording: is_recording.load(Ordering::SeqCst),
+        hotkey_idle: active_mode.load(Ordering::SeqCst) == hotkey::MODE_IDLE,
+        reload_in_progress: ui::frontend_reload_in_progress(),
+        overlay_active: ui::overlay_active(),
+        overlay_quiet: ui::overlay_quiet_for(Duration::from_secs(5)),
+    }
+}
+
+fn duration_to_ticks(duration: Duration) -> u16 {
+    let interval_ms = WATCHDOG_INTERVAL.as_millis().max(1);
+    let ticks = duration.as_millis().div_ceil(interval_ms);
+    ticks.min(u16::MAX as u128) as u16
 }
 
 fn show_pill_window(app: &tauri::AppHandle, wait_for_reload: bool) {
@@ -310,4 +384,16 @@ fn show_pill_window(app: &tauri::AppHandle, wait_for_reload: bool) {
 
     #[cfg(target_os = "windows")]
     ui::force_repaint(&window);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watchdog_duration_rounds_up_to_interval_ticks() {
+        assert_eq!(duration_to_ticks(Duration::from_secs(1)), 1);
+        assert_eq!(duration_to_ticks(Duration::from_secs(2)), 1);
+        assert_eq!(duration_to_ticks(Duration::from_secs(3)), 2);
+    }
 }

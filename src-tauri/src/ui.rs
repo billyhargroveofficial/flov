@@ -9,12 +9,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
 static FRONTEND_READY_EPOCH: AtomicU64 = AtomicU64::new(0);
-static FRONTEND_RELOAD_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static FRONTEND_RELOAD_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 static OVERLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RECORDING_CYCLE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static LAST_OVERLAY_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
 static PILL_STATE: AtomicU8 = AtomicU8::new(PillState::Idle as u8);
+static PILL_EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
 static PILL_ERROR_TEXT: OnceLock<Mutex<String>> = OnceLock::new();
+
+pub const FRONTEND_RELOAD_STALE_AFTER: Duration = Duration::from_secs(15);
 
 #[derive(serde::Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -41,6 +44,51 @@ impl PillState {
 pub struct PillSnapshot {
     state: PillState,
     error_text: String,
+    seq: u64,
+}
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PillEvent {
+    state: PillState,
+    seq: u64,
+}
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PillErrorEvent {
+    message: String,
+    seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReloadGateInput {
+    pub is_recording: bool,
+    pub hotkey_idle: bool,
+    pub reload_in_progress: bool,
+    pub overlay_active: bool,
+    pub overlay_quiet: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadSkipReason {
+    Recording,
+    HotkeyActive,
+    ReloadInProgress,
+    OverlayActive,
+    OverlayNotQuiet,
+}
+
+impl ReloadSkipReason {
+    pub fn log_message(self) -> &'static str {
+        match self {
+            Self::Recording => "recording in progress",
+            Self::HotkeyActive => "hotkey mode active",
+            Self::ReloadInProgress => "previous reload still pending",
+            Self::OverlayActive => "pill logically active",
+            Self::OverlayNotQuiet => "pill was active recently",
+        }
+    }
 }
 
 fn error_text() -> &'static Mutex<String> {
@@ -56,6 +104,10 @@ fn now_ms() -> u64 {
 
 fn touch_overlay_activity() {
     LAST_OVERLAY_ACTIVITY_MS.store(now_ms(), Ordering::SeqCst);
+}
+
+fn next_pill_seq() -> u64 {
+    PILL_EVENT_SEQ.fetch_add(1, Ordering::SeqCst) + 1
 }
 
 #[cfg(target_os = "windows")]
@@ -371,7 +423,7 @@ pub fn repaint_window(window: tauri::WebviewWindow) {
 #[tauri::command]
 pub fn pill_frontend_ready(window: tauri::WebviewWindow) -> PillSnapshot {
     let epoch = FRONTEND_READY_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
-    FRONTEND_RELOAD_IN_PROGRESS.store(false, Ordering::SeqCst);
+    FRONTEND_RELOAD_STARTED_MS.store(0, Ordering::SeqCst);
     if !recording_cycle_active() {
         set_overlay_active(false);
     }
@@ -393,17 +445,64 @@ pub fn frontend_ready_epoch() -> u64 {
     FRONTEND_READY_EPOCH.load(Ordering::SeqCst)
 }
 
-pub fn mark_frontend_reload_started() -> u64 {
-    FRONTEND_RELOAD_IN_PROGRESS.store(true, Ordering::SeqCst);
-    frontend_ready_epoch()
+pub fn reload_gate_decision(input: ReloadGateInput) -> std::result::Result<(), ReloadSkipReason> {
+    if input.is_recording {
+        return Err(ReloadSkipReason::Recording);
+    }
+    if !input.hotkey_idle {
+        return Err(ReloadSkipReason::HotkeyActive);
+    }
+    if input.reload_in_progress {
+        return Err(ReloadSkipReason::ReloadInProgress);
+    }
+    if input.overlay_active {
+        return Err(ReloadSkipReason::OverlayActive);
+    }
+    if !input.overlay_quiet {
+        return Err(ReloadSkipReason::OverlayNotQuiet);
+    }
+    Ok(())
+}
+
+pub fn activity_reload_gate_decision(
+    input: ReloadGateInput,
+) -> std::result::Result<(), ReloadSkipReason> {
+    reload_gate_decision(ReloadGateInput {
+        reload_in_progress: false,
+        ..input
+    })
+}
+
+pub fn try_mark_frontend_reload_started(stale_after: Duration) -> Option<u64> {
+    recover_stale_frontend_reload(stale_after);
+    let now = now_ms().max(1);
+    FRONTEND_RELOAD_STARTED_MS
+        .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
+        .ok()
+        .map(|_| frontend_ready_epoch())
 }
 
 pub fn mark_frontend_reload_finished() {
-    FRONTEND_RELOAD_IN_PROGRESS.store(false, Ordering::SeqCst);
+    FRONTEND_RELOAD_STARTED_MS.store(0, Ordering::SeqCst);
 }
 
 pub fn frontend_reload_in_progress() -> bool {
-    FRONTEND_RELOAD_IN_PROGRESS.load(Ordering::SeqCst)
+    recover_stale_frontend_reload(FRONTEND_RELOAD_STALE_AFTER);
+    FRONTEND_RELOAD_STARTED_MS.load(Ordering::SeqCst) != 0
+}
+
+pub fn recover_stale_frontend_reload(stale_after: Duration) -> bool {
+    let started = FRONTEND_RELOAD_STARTED_MS.load(Ordering::SeqCst);
+    if !reload_started_is_stale(started, now_ms(), stale_after) {
+        return false;
+    }
+    FRONTEND_RELOAD_STARTED_MS
+        .compare_exchange(started, 0, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+fn reload_started_is_stale(started_ms: u64, now_ms: u64, stale_after: Duration) -> bool {
+    started_ms != 0 && now_ms.saturating_sub(started_ms) >= stale_after.as_millis() as u64
 }
 
 pub fn set_recording_cycle_active(active: bool) {
@@ -460,7 +559,7 @@ pub fn wait_for_frontend_reload_if_needed(timeout: Duration) -> bool {
     !frontend_reload_in_progress()
 }
 
-pub fn set_pill_state(state: PillState) {
+pub fn set_pill_state(state: PillState) -> u64 {
     PILL_STATE.store(state as u8, Ordering::SeqCst);
     if !matches!(state, PillState::Error) {
         error_text().lock().unwrap().clear();
@@ -470,18 +569,32 @@ pub fn set_pill_state(state: PillState) {
     } else {
         set_overlay_active(false);
     }
+    next_pill_seq()
 }
 
-pub fn set_pill_error(message: &str) {
+pub fn set_pill_error(message: &str) -> u64 {
     PILL_STATE.store(PillState::Error as u8, Ordering::SeqCst);
     *error_text().lock().unwrap() = message.to_string();
     set_overlay_active(true);
+    next_pill_seq()
 }
 
 pub fn pill_snapshot() -> PillSnapshot {
     PillSnapshot {
         state: PillState::from_u8(PILL_STATE.load(Ordering::SeqCst)),
         error_text: error_text().lock().unwrap().clone(),
+        seq: PILL_EVENT_SEQ.load(Ordering::SeqCst),
+    }
+}
+
+pub fn pill_event(state: PillState, seq: u64) -> PillEvent {
+    PillEvent { state, seq }
+}
+
+pub fn pill_error_event(message: &str, seq: u64) -> PillErrorEvent {
+    PillErrorEvent {
+        message: message.to_string(),
+        seq,
     }
 }
 
@@ -510,4 +623,54 @@ pub fn hide_window(window: tauri::WebviewWindow) {
     }
     #[cfg(not(target_os = "windows"))]
     let _ = window;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reload_gate_allows_idle_quiet_state() {
+        let input = ReloadGateInput {
+            is_recording: false,
+            hotkey_idle: true,
+            reload_in_progress: false,
+            overlay_active: false,
+            overlay_quiet: true,
+        };
+
+        assert_eq!(reload_gate_decision(input), Ok(()));
+    }
+
+    #[test]
+    fn reload_gate_rejects_activity_before_quiet_time() {
+        let mut input = ReloadGateInput {
+            is_recording: false,
+            hotkey_idle: true,
+            reload_in_progress: false,
+            overlay_active: false,
+            overlay_quiet: false,
+        };
+        assert_eq!(
+            reload_gate_decision(input),
+            Err(ReloadSkipReason::OverlayNotQuiet)
+        );
+
+        input.is_recording = true;
+        assert_eq!(
+            reload_gate_decision(input),
+            Err(ReloadSkipReason::Recording)
+        );
+    }
+
+    #[test]
+    fn reload_started_stale_after_timeout() {
+        assert!(!reload_started_is_stale(0, 100, Duration::from_millis(10)));
+        assert!(!reload_started_is_stale(
+            100,
+            109,
+            Duration::from_millis(10)
+        ));
+        assert!(reload_started_is_stale(100, 110, Duration::from_millis(10)));
+    }
 }

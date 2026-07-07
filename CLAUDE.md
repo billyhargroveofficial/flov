@@ -38,7 +38,8 @@ flov/
 │       │                  # Tauri Builder, manage state, spawn runtime workers
 │       ├── recording.rs   # runtime loop: hotkey → record → transcribe → postprocess → paste,
 │       │                  # watchdog, periodic pill webview reload, recording-cycle guard
-│       ├── audio.rs       # WASAPI/CoreAudio запись через cpal, ресемплинг 16kHz, FFT-спектр для оверлея
+│       ├── audio.rs       # AudioCaptureManager + short-lived cpal recorder per hotkey cycle,
+│       │                  # ресемплинг 16kHz, FFT-спектр для оверлея
 │       ├── hotkey.rs      # глобальный keyboard hook (Win32 WH_KEYBOARD_LL / macOS CGEventTap / Linux evdev),
 │       │                  # парсер combo строк (Ctrl+Win, Cmd+Alt, RCtrl и т.д.), live re-bind
 │       ├── input.rs       # вставка через clipboard + paste hotkey (Win32 SendInput Ctrl+V /
@@ -97,13 +98,17 @@ flov/
 картины — wire protocol, build, добавление нового sidecar (Mac/Metal гайд
 там же).
 
-Селекция backend'а в `transcribe::resolve_sidecar`:
+Селекция backend'а в `transcribe::resolve_sidecar_plan`:
 1. `FLOV_BACKEND` env var (debug override)
 2. `[backend].choice` из flov.toml (тогглится из Settings → Backend)
-3. `auto` → priority `[cuda, vulkan, metal, cpu]`, первый существующий рядом с exe
+3. `auto` → priority `[cuda, vulkan, metal, cpu]`, первый usable рядом с exe.
+   CUDA на Windows считается usable только если есть sidecar binary и NVIDIA
+   driver runtime (`nvcuda.dll`) доступен.
 
 При смене backend'а из Settings не нужен рестарт — Transcriber резолвит
-sidecar на каждый transcribe call через shared `Arc<Mutex<String>>`.
+sidecar на каждый transcribe call через shared `Arc<Mutex<String>>`. В auto
+runtime-class failures (spawn/missing runtime/GPU init) fallback'ятся на
+следующий backend; model load/corrupt model ошибки не fallback'ятся.
 
 ## UI flow
 
@@ -211,6 +216,12 @@ Vulkan build требует LunarG SDK: `winget install KhronosGroup.VulkanSDK`,
 - `.\scripts\build-bundle.ps1` — CPU + Vulkan (zero deps на машине user'a)
 - `.\scripts\build-bundle.ps1 -IncludeCuda` — добавляет CUDA sidecar
   и cublas DLLs (требует CUDA toolkit при сборке, NVIDIA driver у юзера)
+- `.\scripts\build-bundle.ps1 -SkipSidecars` — переиспользует sidecars,
+  но валидирует `src-tauri/binaries/sidecars-manifest.json` по source hash,
+  target triple, file size и sha256. Если manifest отсутствует/устарел —
+  rebuild без `-SkipSidecars`.
+- `.\scripts\build-bundle.ps1 -ReleasePreflight` — opt-in clean-tree,
+  version/tag/Cargo.lock, `npm ci`, `cargo check --locked`.
 
 Tauri требует sidecar бинари с triple-суффиксом
 (`flov-whisper-cpu-x86_64-pc-windows-msvc.exe`) в
@@ -236,6 +247,11 @@ flov.toml                    # опционален — Settings создаст
 
 Можно класть несколько sidecar бинарей рядом — pick'ается на runtime.
 Vulkan/CPU sidecars не требуют дополнительных DLL.
+
+Mic selection из Settings применяется на следующую запись: recorder больше
+не держит device/config с процесса startup, `AudioCaptureManager` создаёт
+short-lived `AudioRecorder` per hotkey cycle и заново резолвит saved/default
+device.
 
 ## flov.toml
 
@@ -402,7 +418,9 @@ Windows repaint тоже делается в два шага: Rust всё ещё
 переименовывает cuBLAS DLLs (если CUDA вариант).
 
 `build-bundle.ps1` качает vc_redist.x64.exe с
-`aka.ms/vs/17/release/vc_redist.x64.exe` всегда (не только для CUDA).
+`aka.ms/vs/17/release/vc_redist.x64.exe` всегда (не только для CUDA) и пишет
+рядом JSON metadata с downloadedAt/size/sha256, потому URL отдаёт latest
+patched build.
 
 ### cuBLAS DLLs path quirk (Tauri 2 NSIS)
 
@@ -411,6 +429,10 @@ Windows repaint тоже делается в два шага: Rust всё ещё
 подумать. Поэтому NSIS hook ищет cuBLAS в `$INSTDIR\binaries\runtime\`
 (не `resources\runtime\`) и переименовывает в `$INSTDIR\` (рядом с exe —
 системный DLL search path).
+
+CUDA packaging теперь opt-in: `build-bundle.ps1 -IncludeCuda`. Если CUDA
+включена, отсутствие CUDA bin dir или `cublas64_13.dll`/`cublasLt64_13.dll`
+— hard fail, не warning. Default Windows installer остаётся CPU+Vulkan.
 
 ### Logging: OpenOptions::append, не File::create
 

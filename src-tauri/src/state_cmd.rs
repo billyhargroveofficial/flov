@@ -23,8 +23,8 @@ pub struct AppState {
     /// Current key combo string for the global hotkey (e.g. "Ctrl+Win").
     pub hotkey_combo: Arc<Mutex<String>>,
     /// Selected microphone (cpal device name). `None` → system default.
-    /// Changing this only takes effect on the next launch — the running
-    /// AudioRecorder holds the open stream and is not re-created.
+    /// Changing this takes effect on the next recording; AudioCaptureManager
+    /// resolves the selected/default device for each hotkey cycle.
     pub audio_device: Arc<Mutex<Option<String>>>,
     pub stats: Arc<Stats>,
 }
@@ -67,6 +67,12 @@ pub fn get_backend_state(state: State<AppState>) -> BackendStateView {
 
 #[tauri::command]
 pub fn set_backend_choice(choice: String, state: State<AppState>) -> Result<(), String> {
+    if choice != "auto" && !state.available_backends.iter().any(|b| b == &choice) {
+        return Err(format!(
+            "backend '{}' is not available on this machine",
+            choice
+        ));
+    }
     {
         let mut guard = state.backend_choice.lock().unwrap();
         *guard = choice.clone();
@@ -198,7 +204,7 @@ pub fn set_audio_input(device: Option<String>, state: State<AppState>) -> Result
         .map_err(|e| e.to_string())?;
     *state.audio_device.lock().unwrap() = cleaned.clone();
     tracing::info!(
-        "audio device selected: {:?} (takes effect after restart)",
+        "audio device selected: {:?} (takes effect on next recording)",
         cleaned
     );
     Ok(())

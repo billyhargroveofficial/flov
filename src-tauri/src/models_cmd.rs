@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::models::{self, ModelInfo};
 
@@ -77,8 +77,8 @@ pub fn download_model(id: String, state: State<ModelState>, app: AppHandle) -> R
         let result = run_download(&id, &url, &dest, expected_size, &app);
         if let Err(e) = &result {
             tracing::error!("download {} failed: {}", id, e);
-            let _ = app.emit(
-                "model-progress",
+            emit_model_progress(
+                &app,
                 ProgressEvent {
                     id: id.clone(),
                     downloaded: 0,
@@ -113,8 +113,8 @@ pub fn download_model(id: String, state: State<ModelState>, app: AppHandle) -> R
                 }
             }
 
-            let _ = app.emit(
-                "model-progress",
+            emit_model_progress(
+                &app,
                 ProgressEvent {
                     id: id.clone(),
                     downloaded: expected_size,
@@ -171,8 +171,8 @@ fn run_download(
         downloaded += n as u64;
         // Throttle progress events to ~10/s; UI doesn't need finer.
         if last_emit.elapsed() > std::time::Duration::from_millis(100) {
-            let _ = app.emit(
-                "model-progress",
+            emit_model_progress(
+                app,
                 ProgressEvent {
                     id: id.to_string(),
                     downloaded,
@@ -189,6 +189,12 @@ fn run_download(
     drop(file);
     std::fs::rename(&tmp, dest).with_context(|| format!("rename {:?} -> {:?}", tmp, dest))?;
     Ok(())
+}
+
+fn emit_model_progress(app: &AppHandle, event: ProgressEvent) {
+    if let Some(window) = app.get_webview_window("settings") {
+        let _ = window.emit("model-progress", event);
+    }
 }
 
 #[tauri::command]

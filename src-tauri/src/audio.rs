@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{FromSample, Sample, SizedSample};
 use rustfft::{num_complex::Complex, FftPlanner};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const SPECTRUM_FFT_SIZE: usize = 2048;
 const SPECTRUM_BANDS: usize = 20;
@@ -48,21 +51,34 @@ impl SpectrumRing {
 
 struct CaptureState {
     samples: Vec<f32>,
+    max_samples: usize,
+    clipped: bool,
     spectrum: SpectrumRing,
 }
 
 impl CaptureState {
-    fn with_capacity(sample_capacity: usize) -> Self {
+    fn with_capacity(sample_capacity: usize, max_samples: usize) -> Self {
         Self {
             samples: Vec::with_capacity(sample_capacity),
+            max_samples,
+            clipped: false,
             spectrum: SpectrumRing::new(),
         }
     }
 
     fn push(&mut self, sample: f32) {
-        self.samples.push(sample);
+        if self.samples.len() < self.max_samples {
+            self.samples.push(sample);
+        } else {
+            self.clipped = true;
+        }
         self.spectrum.push(sample);
     }
+}
+
+pub struct AudioCaptureManager {
+    target_sample_rate: u32,
+    preferred_device: Arc<Mutex<Option<String>>>,
 }
 
 /// Enumerate currently-connected input devices by name (whatever cpal /
@@ -79,8 +95,43 @@ pub fn list_input_devices() -> Vec<String> {
     }
 }
 
+impl AudioCaptureManager {
+    pub fn new(target_sample_rate: u32, preferred_device: Arc<Mutex<Option<String>>>) -> Self {
+        if target_sample_rate != TRANSCRIBE_SAMPLE_RATE {
+            tracing::warn!(
+                "configured audio.sample_rate={} ignored; whisper sidecars require {} Hz PCM",
+                target_sample_rate,
+                TRANSCRIBE_SAMPLE_RATE
+            );
+        }
+        Self {
+            target_sample_rate,
+            preferred_device,
+        }
+    }
+
+    pub fn output_sample_rate(&self) -> u32 {
+        TRANSCRIBE_SAMPLE_RATE
+    }
+
+    pub fn record_while_with_spectrum<F, C>(
+        &self,
+        should_continue: F,
+        on_spectrum: C,
+        max_duration: Duration,
+    ) -> Result<Vec<f32>>
+    where
+        F: Fn() -> bool + Send + 'static,
+        C: Fn(Vec<f32>) + Send + 'static,
+    {
+        let preferred = self.preferred_device.lock().unwrap().clone();
+        let recorder = AudioRecorder::new(self.target_sample_rate, preferred.as_deref())?;
+        recorder.record_while_with_spectrum(should_continue, on_spectrum, max_duration)
+    }
+}
+
 impl AudioRecorder {
-    pub fn new(target_sample_rate: u32, preferred_device: Option<&str>) -> Result<Self> {
+    pub fn new(_target_sample_rate: u32, preferred_device: Option<&str>) -> Result<Self> {
         let host = cpal::default_host();
         let device = match preferred_device.and_then(|s| if s.is_empty() { None } else { Some(s) })
         {
@@ -119,14 +170,6 @@ impl AudioRecorder {
             config.sample_format()
         );
 
-        if target_sample_rate != TRANSCRIBE_SAMPLE_RATE {
-            tracing::warn!(
-                "configured audio.sample_rate={} ignored; whisper sidecars require {} Hz PCM",
-                target_sample_rate,
-                TRANSCRIBE_SAMPLE_RATE
-            );
-        }
-
         Ok(Self {
             device,
             config,
@@ -143,6 +186,7 @@ impl AudioRecorder {
         &self,
         should_continue: F,
         on_spectrum: C,
+        max_duration: Duration,
     ) -> Result<Vec<f32>>
     where
         F: Fn() -> bool + Send + 'static,
@@ -150,48 +194,49 @@ impl AudioRecorder {
     {
         let channels = self.config.channels() as usize;
         let native_rate = self.config.sample_rate().0;
+        let max_native_samples = ((native_rate as f64 * max_duration.as_secs_f64()).ceil()
+            as usize)
+            .max(native_rate as usize);
         let initial_capacity = (native_rate as usize)
             .saturating_mul(10)
-            .min(48_000usize * 30);
-        let capture = Arc::new(Mutex::new(CaptureState::with_capacity(initial_capacity)));
-
-        let err_fn = |err| {
-            eprintln!("Audio stream error: {}", err);
-        };
+            .min(48_000usize * 30)
+            .min(max_native_samples);
+        let capture = Arc::new(Mutex::new(CaptureState::with_capacity(
+            initial_capacity,
+            max_native_samples,
+        )));
+        let (err_tx, err_rx) = mpsc::channel::<String>();
 
         let stream = match self.config.sample_format() {
-            cpal::SampleFormat::F32 => {
-                let config: cpal::StreamConfig = self.config.clone().into();
-                let capture_clone = capture.clone();
-                self.device.build_input_stream(
-                    &config,
-                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        let mut capture = capture_clone.lock().unwrap();
-                        for chunk in data.chunks(channels) {
-                            let mono: f32 = chunk.iter().sum::<f32>() / channels as f32;
-                            capture.push(mono);
-                        }
-                    },
-                    err_fn,
-                    None,
-                )?
+            cpal::SampleFormat::I8 => {
+                self.build_input_stream::<i8>(channels, capture.clone(), err_tx.clone())?
             }
             cpal::SampleFormat::I16 => {
-                let config: cpal::StreamConfig = self.config.clone().into();
-                let capture_clone = capture.clone();
-                self.device.build_input_stream(
-                    &config,
-                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        let mut capture = capture_clone.lock().unwrap();
-                        for chunk in data.chunks(channels) {
-                            let mono: f32 = chunk.iter().map(|&s| s as f32 / 32768.0).sum::<f32>()
-                                / channels as f32;
-                            capture.push(mono);
-                        }
-                    },
-                    err_fn,
-                    None,
-                )?
+                self.build_input_stream::<i16>(channels, capture.clone(), err_tx.clone())?
+            }
+            cpal::SampleFormat::I32 => {
+                self.build_input_stream::<i32>(channels, capture.clone(), err_tx.clone())?
+            }
+            cpal::SampleFormat::I64 => {
+                self.build_input_stream::<i64>(channels, capture.clone(), err_tx.clone())?
+            }
+            cpal::SampleFormat::U8 => {
+                self.build_input_stream::<u8>(channels, capture.clone(), err_tx.clone())?
+            }
+            cpal::SampleFormat::U16 => {
+                self.build_input_stream::<u16>(channels, capture.clone(), err_tx.clone())?
+            }
+            cpal::SampleFormat::U32 => {
+                self.build_input_stream::<u32>(channels, capture.clone(), err_tx.clone())?
+            }
+            cpal::SampleFormat::U64 => {
+                self.build_input_stream::<u64>(channels, capture.clone(), err_tx.clone())?
+            }
+            cpal::SampleFormat::F32 => {
+                self.build_input_stream::<f32>(channels, capture.clone(), err_tx.clone())?
+            }
+            cpal::SampleFormat::F64 => {
+                self.build_input_stream::<f64>(channels, capture.clone(), err_tx.clone())?
             }
             _ => return Err(anyhow::anyhow!("Unsupported sample format")),
         };
@@ -210,6 +255,10 @@ impl AudioRecorder {
         let mut complex_buf = vec![Complex::new(0.0, 0.0); SPECTRUM_FFT_SIZE];
 
         while should_continue() {
+            if let Ok(err) = err_rx.try_recv() {
+                return Err(anyhow::anyhow!("audio stream error: {}", err));
+            }
+
             let has_full_window = {
                 let capture = capture.lock().unwrap();
                 capture.spectrum.copy_ordered_into(&mut fft_samples)
@@ -252,11 +301,21 @@ impl AudioRecorder {
 
         drop(stream);
 
-        let samples = Arc::try_unwrap(capture)
+        if let Ok(err) = err_rx.try_recv() {
+            return Err(anyhow::anyhow!("audio stream error: {}", err));
+        }
+
+        let capture = Arc::try_unwrap(capture)
             .map_err(|_| anyhow::anyhow!("Failed to unwrap samples"))?
             .into_inner()
-            .unwrap()
-            .samples;
+            .unwrap();
+        if capture.clipped {
+            tracing::warn!(
+                "audio capture buffer reached max duration {:?}; clipped additional input",
+                max_duration
+            );
+        }
+        let samples = capture.samples;
 
         if native_rate != self.output_sample_rate {
             Ok(resample(&samples, native_rate, self.output_sample_rate))
@@ -264,6 +323,46 @@ impl AudioRecorder {
             Ok(samples)
         }
     }
+
+    fn build_input_stream<T>(
+        &self,
+        channels: usize,
+        capture: Arc<Mutex<CaptureState>>,
+        err_tx: mpsc::Sender<String>,
+    ) -> Result<cpal::Stream>
+    where
+        T: Sample + SizedSample + Send + 'static,
+        f32: FromSample<T>,
+    {
+        let config: cpal::StreamConfig = self.config.clone().into();
+        let err_fn = move |err: cpal::StreamError| {
+            let _ = err_tx.send(err.to_string());
+        };
+        Ok(self.device.build_input_stream(
+            &config,
+            move |data: &[T], _: &cpal::InputCallbackInfo| {
+                let mut capture = capture.lock().unwrap();
+                for chunk in data.chunks(channels) {
+                    let mono = chunk
+                        .iter()
+                        .map(|&sample| sample_to_f32(sample))
+                        .sum::<f32>()
+                        / channels as f32;
+                    capture.push(mono);
+                }
+            },
+            err_fn,
+            None,
+        )?)
+    }
+}
+
+fn sample_to_f32<T>(sample: T) -> f32
+where
+    T: Sample,
+    f32: FromSample<T>,
+{
+    sample.to_sample::<f32>()
 }
 
 // Simple linear resampling
@@ -340,5 +439,19 @@ mod tests {
         assert!(ring.copy_ordered_into(&mut out));
         assert_eq!(out[0], 3.0);
         assert_eq!(out[SPECTRUM_FFT_SIZE - 1], (SPECTRUM_FFT_SIZE + 2) as f32);
+    }
+
+    #[test]
+    fn converts_unsigned_samples_around_equilibrium() {
+        assert!((sample_to_f32(32_768u16) - 0.0).abs() < 0.0001);
+        assert!(sample_to_f32(0u16) < -0.99);
+        assert!(sample_to_f32(u16::MAX) > 0.99);
+    }
+
+    #[test]
+    fn converts_wide_integer_and_float_samples() {
+        assert!((sample_to_f32(0i32) - 0.0).abs() < 0.0001);
+        assert!(sample_to_f32(i32::MAX) > 0.99);
+        assert!((sample_to_f32(0.5f64) - 0.5).abs() < 0.0001);
     }
 }

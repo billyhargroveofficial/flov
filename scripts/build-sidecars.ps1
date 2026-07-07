@@ -51,7 +51,7 @@ function Build-One($name) {
         return
     }
     Write-Host ">> building flov-whisper-$name ($Profile)" -ForegroundColor Cyan
-    $args = @("build", "--manifest-path", "$crate/Cargo.toml", "--target-dir", $targetDir)
+    $args = @("build", "--locked", "--manifest-path", "$crate/Cargo.toml", "--target-dir", $targetDir)
     if ($Profile -eq "release") { $args += "--release" }
     cargo @args
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed for flov-whisper-$name" }
@@ -73,18 +73,21 @@ function Build-One($name) {
 
 function Stage-CudaDlls {
     if (-not (Test-Path $cudaBin)) {
-        Write-Warning "CUDA bin dir not found at $cudaBin — cublas DLLs not staged"
-        return
+        throw "CUDA backend requested but CUDA bin dir not found at $cudaBin"
     }
+    $missing = @()
     foreach ($dst in $stageDirs) {
         foreach ($dll in $cudaDlls) {
             $src = Join-Path $cudaBin $dll
             if (Test-Path $src) {
                 Copy-Item $src (Join-Path $dst $dll) -Force
             } else {
-                Write-Warning "missing: $src"
+                $missing += $src
             }
         }
+    }
+    if ($missing.Count -gt 0) {
+        throw "CUDA backend requested but required cuBLAS DLLs are missing: $($missing -join ', ')"
     }
 }
 
