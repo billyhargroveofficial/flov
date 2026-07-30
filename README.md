@@ -1,12 +1,16 @@
 # Flov
 
-Voice-to-text для Windows и macOS (Apple Silicon). Зажми хоткей, говори,
-отпусти — текст вставляется в активное поле через буфер обмена.
+Voice-to-text для Windows, macOS (Apple Silicon) и Linux/Wayland. Зажми
+хоткей, говори, отпусти — текст вставляется в активное поле через буфер
+обмена.
 
 Текущая версия: `0.2.3`.
 
 Транскрипция локальная (Whisper.cpp на GPU). Опциональная пост-обработка
 через OpenRouter (clean-up пунктуации/мата/etc).
+
+Также есть OpenAI-совместимый endpoint для внешних сервисов:
+`POST /v1/audio/transcriptions`.
 
 ## Запуск (Windows)
 
@@ -64,6 +68,26 @@ entries. Перетаскивай в Applications **до** первого зап
 tccutil reset Accessibility com.flov.app
 tccutil reset Microphone com.flov.app
 ```
+
+## Запуск (Linux, Wayland / Hyprland)
+
+1. Установи системные зависимости из [docs/LINUX.md](docs/LINUX.md).
+2. Запусти `./dev.sh` или собери AppImage через
+   `./scripts/build-bundle-linux.sh`.
+3. Установи AppImage и ярлык для Rofi командой
+   `./scripts/install-linux.sh`.
+4. Запусти **Flov** через Rofi и в Settings → Models скачай модель.
+5. Добавь press/release бинды Hyprland на `flov --record-start` и
+   `flov --record-stop`.
+
+На Linux по умолчанию также работает evdev fallback на `RCtrl`, если
+пользователь имеет доступ к `/dev/input`. Вставка выполняется нативно для
+Wayland через `wl-copy` + `wtype`.
+
+Полная настройка окна, хоткея, CUDA/Vulkan и AppImage:
+[docs/LINUX.md](docs/LINUX.md).
+
+HTTP API, LAN bind и bearer token: [docs/API.md](docs/API.md).
 
 ## Settings (правый клик по трею → Open Settings)
 
@@ -131,6 +155,24 @@ brew install rust cmake node      # если их ещё нет
 Полный гайд + permissions (Microphone, Accessibility) + архитектурные
 заметки — [docs/MACOS.md](docs/MACOS.md).
 
+## Сборка из исходников (Linux / Wayland)
+
+Требования для Arch Linux перечислены в [docs/LINUX.md](docs/LINUX.md).
+
+```bash
+npm ci --prefix ui
+
+# Дев-режим, CPU + автоматически выбранный CUDA/Vulkan sidecar
+./dev.sh
+
+# AppImage
+./scripts/build-bundle-linux.sh
+./scripts/build-bundle-linux.sh --backend cuda
+
+# Установка AppImage + launcher + ярлык Rofi для текущего пользователя
+./scripts/install-linux.sh
+```
+
 ## Bundle для релиза
 
 ### Windows: NSIS installer
@@ -176,7 +218,8 @@ Microphone (см. "Подводные камни macOS" выше).
 ## Стек
 
 - Tauri 2 + Svelte 5 (frontend, frameless transparent windows)
-- Rust + cpal (WASAPI/CoreAudio запись) + windows-rs / core-graphics
-  (хук клавиатуры)
+- Rust + cpal (WASAPI/CoreAudio/ALSA запись) + windows-rs / core-graphics /
+  evdev (хук клавиатуры)
 - whisper-rs sidecar бинари по backend'у (CUDA / Vulkan / Metal / CPU)
 - OpenRouter HTTP API через ureq
+- OpenAI-совместимый локальный HTTP endpoint, Symphonia audio decode

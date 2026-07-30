@@ -147,9 +147,6 @@
 
     background: var(--pill-bg);
     color: var(--pill-fg);
-    box-shadow:
-      0 6px 18px rgba(0, 0, 0, 0.18),
-      0 1px 3px rgba(0, 0, 0, 0.1);
 
     /* Smooth colour shift between recording (text colour) and processing
        (accent). currentColor in AudioWave's stroke picks this up. */
@@ -163,9 +160,6 @@
       --pill-bg: #1c1c1e;
       --pill-fg: #f5f5f7;
       --pill-accent: #d9ff42;
-      box-shadow:
-        0 6px 18px rgba(0, 0, 0, 0.55),
-        0 1px 3px rgba(0, 0, 0, 0.4);
     }
   }
   .pill.processing { color: var(--pill-accent); }

@@ -8,7 +8,9 @@ use crate::{audio, hotkey, input, postprocess, stats, transcribe, tray, ui};
 
 pub struct RecordingRuntime {
     pub app: tauri::AppHandle,
-    pub recorder: Arc<audio::AudioRecorder>,
+    /// `None` keeps the HTTP transcription service usable on a machine
+    /// without a local capture device.
+    pub recorder: Option<Arc<audio::AudioRecorder>>,
     pub transcriber: Arc<transcribe::Transcriber>,
     pub active_mode: Arc<AtomicU8>,
     pub is_recording: Arc<AtomicBool>,
@@ -160,6 +162,15 @@ fn recording_loop(runtime: RecordingRuntime) {
             wait_for_hotkey_release(&active_mode);
             continue;
         }
+
+        let Some(recorder) = recorder.as_ref() else {
+            show_pill_window(&app, true);
+            emit_transcribe_error(&app, "Микрофон недоступен — проверь PipeWire/ALSA");
+            tracing::warn!("hotkey pressed but no local audio input is available");
+            is_recording.store(false, Ordering::SeqCst);
+            wait_for_hotkey_release(&active_mode);
+            continue;
+        };
 
         show_pill_window(&app, true);
         emit_state(&app, ui::PillState::Recording);

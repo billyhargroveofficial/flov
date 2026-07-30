@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{FromSample, Sample, SizedSample};
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::sync::{Arc, Mutex};
 
@@ -82,8 +83,7 @@ pub fn list_input_devices() -> Vec<String> {
 impl AudioRecorder {
     pub fn new(target_sample_rate: u32, preferred_device: Option<&str>) -> Result<Self> {
         let host = cpal::default_host();
-        let device = match preferred_device.and_then(|s| if s.is_empty() { None } else { Some(s) })
-        {
+        let device = match preferred_device.filter(|s| !s.is_empty()) {
             Some(name) => {
                 let found = host
                     .input_devices()
@@ -155,45 +155,38 @@ impl AudioRecorder {
             .min(48_000usize * 30);
         let capture = Arc::new(Mutex::new(CaptureState::with_capacity(initial_capacity)));
 
-        let err_fn = |err| {
-            eprintln!("Audio stream error: {}", err);
-        };
-
         let stream = match self.config.sample_format() {
-            cpal::SampleFormat::F32 => {
-                let config: cpal::StreamConfig = self.config.clone().into();
-                let capture_clone = capture.clone();
-                self.device.build_input_stream(
-                    &config,
-                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        let mut capture = capture_clone.lock().unwrap();
-                        for chunk in data.chunks(channels) {
-                            let mono: f32 = chunk.iter().sum::<f32>() / channels as f32;
-                            capture.push(mono);
-                        }
-                    },
-                    err_fn,
-                    None,
-                )?
+            cpal::SampleFormat::I8 => {
+                build_input_stream::<i8>(&self.device, &self.config, channels, capture.clone())?
             }
             cpal::SampleFormat::I16 => {
-                let config: cpal::StreamConfig = self.config.clone().into();
-                let capture_clone = capture.clone();
-                self.device.build_input_stream(
-                    &config,
-                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        let mut capture = capture_clone.lock().unwrap();
-                        for chunk in data.chunks(channels) {
-                            let mono: f32 = chunk.iter().map(|&s| s as f32 / 32768.0).sum::<f32>()
-                                / channels as f32;
-                            capture.push(mono);
-                        }
-                    },
-                    err_fn,
-                    None,
-                )?
+                build_input_stream::<i16>(&self.device, &self.config, channels, capture.clone())?
             }
-            _ => return Err(anyhow::anyhow!("Unsupported sample format")),
+            cpal::SampleFormat::I32 => {
+                build_input_stream::<i32>(&self.device, &self.config, channels, capture.clone())?
+            }
+            cpal::SampleFormat::I64 => {
+                build_input_stream::<i64>(&self.device, &self.config, channels, capture.clone())?
+            }
+            cpal::SampleFormat::U8 => {
+                build_input_stream::<u8>(&self.device, &self.config, channels, capture.clone())?
+            }
+            cpal::SampleFormat::U16 => {
+                build_input_stream::<u16>(&self.device, &self.config, channels, capture.clone())?
+            }
+            cpal::SampleFormat::U32 => {
+                build_input_stream::<u32>(&self.device, &self.config, channels, capture.clone())?
+            }
+            cpal::SampleFormat::U64 => {
+                build_input_stream::<u64>(&self.device, &self.config, channels, capture.clone())?
+            }
+            cpal::SampleFormat::F32 => {
+                build_input_stream::<f32>(&self.device, &self.config, channels, capture.clone())?
+            }
+            cpal::SampleFormat::F64 => {
+                build_input_stream::<f64>(&self.device, &self.config, channels, capture.clone())?
+            }
+            format => return Err(anyhow::anyhow!("Unsupported sample format: {format}")),
         };
 
         stream.play()?;
@@ -266,8 +259,42 @@ impl AudioRecorder {
     }
 }
 
+fn build_input_stream<T>(
+    device: &cpal::Device,
+    supported: &cpal::SupportedStreamConfig,
+    channels: usize,
+    capture: Arc<Mutex<CaptureState>>,
+) -> Result<cpal::Stream>
+where
+    T: SizedSample + Send + 'static,
+    f32: FromSample<T>,
+{
+    let config: cpal::StreamConfig = supported.clone().into();
+    let stream = device.build_input_stream(
+        &config,
+        move |data: &[T], _: &cpal::InputCallbackInfo| {
+            let mut capture = capture.lock().unwrap();
+            for frame in data.chunks(channels) {
+                let mono = frame
+                    .iter()
+                    .copied()
+                    .map(<f32 as Sample>::from_sample)
+                    .sum::<f32>()
+                    / channels as f32;
+                capture.push(mono);
+            }
+        },
+        |err| tracing::error!("audio stream error: {}", err),
+        None,
+    )?;
+    Ok(stream)
+}
+
 // Simple linear resampling
-fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+pub(crate) fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if samples.is_empty() || from_rate == 0 || to_rate == 0 {
+        return Vec::new();
+    }
     let ratio = from_rate as f64 / to_rate as f64;
     let new_len = (samples.len() as f64 / ratio) as usize;
     let mut result = Vec::with_capacity(new_len);

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Bash equivalent of scripts/build-sidecars.ps1 — builds every
 # `crates/flov-whisper-*` it finds (the PowerShell version targets
-# Windows/CUDA, this one targets macOS and skips CUDA/Vulkan which
-# don't apply on Apple Silicon).
+# Windows/CUDA, this one targets macOS and Linux.
 #
 # Usage:
 #   ./scripts/build-sidecars.sh                  # build all macOS-relevant sidecars (release)
@@ -71,12 +70,10 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     apple_build_env
 fi
 
-# On macOS we only care about CPU + Metal (no CUDA/Vulkan). The script
-# silently skips a backend whose crate directory doesn't exist, so
-# future additions (e.g. CoreML-augmented Metal) plug in automatically.
 case "$(uname -s)" in
     Darwin) candidates=("cpu" "metal") ;;
-    *)      candidates=("cpu" "metal" "vulkan" "cuda") ;;
+    Linux)  candidates=("cpu" "vulkan" "cuda") ;;
+    *)      candidates=("cpu") ;;
 esac
 
 build_one() {
@@ -101,7 +98,10 @@ build_one() {
 
     for dst in "${stage_dirs[@]}"; do
         mkdir -p "$dst"
-        cp -f "$exe" "$dst/flov-whisper-$name"
+        local staged="$dst/flov-whisper-$name"
+        if [[ "$exe" != "$staged" ]]; then
+            cp -f "$exe" "$staged"
+        fi
     done
 }
 
