@@ -72,7 +72,18 @@ fn cuda_runtime_present() -> bool {
 
 #[cfg(not(target_os = "windows"))]
 fn cuda_runtime_present() -> bool {
-    false
+    #[cfg(target_os = "linux")]
+    {
+        // libcuda belongs to the display driver, not the CUDA toolkit. The
+        // character device is a cheap and reliable signal that the NVIDIA
+        // driver is loaded in the current Linux session.
+        std::path::Path::new("/dev/nvidiactl").exists()
+            || std::path::Path::new("/proc/driver/nvidia/version").exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 pub struct Transcriber {
@@ -80,6 +91,10 @@ pub struct Transcriber {
     language: String,
     /// Shared with the tray menu; updated when the user picks a backend.
     backend_choice: Arc<Mutex<String>>,
+    /// GPU sidecars can reserve most of the device while loading a model.
+    /// Serialize local hotkey and HTTP requests so simultaneous calls cannot
+    /// race into OOM or contend on the same accelerator.
+    inference_lock: Mutex<()>,
 }
 
 impl Transcriber {
@@ -96,6 +111,7 @@ impl Transcriber {
             model_path,
             language,
             backend_choice,
+            inference_lock: Mutex::new(()),
         })
     }
 
@@ -106,7 +122,23 @@ impl Transcriber {
         self.model_path.lock().unwrap().exists()
     }
 
+    pub fn default_language(&self) -> &str {
+        &self.language
+    }
+
     pub fn transcribe(&self, samples: &[f32]) -> Result<String> {
+        self.transcribe_with_language(samples, None)
+    }
+
+    /// Transcribe with an optional per-request ISO language code. The desktop
+    /// hotkey uses the configured default; the HTTP API mirrors OpenAI's
+    /// `language` form field through this override.
+    pub fn transcribe_with_language(
+        &self,
+        samples: &[f32],
+        language: Option<&str>,
+    ) -> Result<String> {
+        let _inference_guard = self.inference_lock.lock().unwrap();
         let total_start = Instant::now();
         let choice = self.backend_choice.lock().unwrap().clone();
         let (backend, sidecar) = resolve_sidecar(&choice)?;
@@ -118,17 +150,18 @@ impl Transcriber {
             );
         }
         tracing::info!(
-            "transcribe via {} | model={:?} | sidecar={:?}",
+            "transcribe via {} | model={:?} | sidecar={:?} | language={}",
             backend,
             model_path,
-            sidecar
+            sidecar,
+            language.unwrap_or(&self.language)
         );
 
         let mut cmd = Command::new(&sidecar);
         cmd.arg("--model")
             .arg(&model_path)
             .arg("--language")
-            .arg(&self.language)
+            .arg(language.unwrap_or(&self.language))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -277,13 +310,16 @@ fn resolve_sidecar(choice: &str) -> Result<(String, PathBuf)> {
                 candidate
             );
         }
+        if effective == "cuda" && !cuda_runtime_present() {
+            anyhow::bail!("CUDA backend selected but no active NVIDIA driver was detected");
+        }
         return Ok((effective, candidate));
     }
 
     let mut tried = Vec::new();
     for backend in BACKEND_PRIORITY {
         let candidate = dir.join(backend_bin_name(backend));
-        if candidate.exists() {
+        if candidate.exists() && (*backend != "cuda" || cuda_runtime_present()) {
             return Ok(((*backend).to_string(), candidate));
         }
         tried.push(candidate);

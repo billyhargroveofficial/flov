@@ -2,7 +2,7 @@
 name = "flov_app"
 version = "0.2.3"
 edition = "2021"
-description = "Voice-to-text desktop app (Windows / macOS)"
+description = "Voice-to-text desktop app (Windows / macOS / Linux)"
 
 [lib]
 name = "flov_lib"
@@ -40,6 +40,12 @@ anyhow = "1"
 
 # HTTP client for OpenRouter API
 ureq = { version = "3", features = ["json"] }
+
+# Local/OpenAI-compatible transcription API. `tiny_http` keeps the server
+# independent from Tauri's async runtime; Symphonia decodes uploaded audio
+# (WAV/MP3/FLAC/Ogg/AAC) before it is resampled for Whisper.
+tiny_http = "0.12"
+symphonia = { version = "0.5", features = ["all"] }
 
 # FFT for frequency spectrum
 rustfft = "6"

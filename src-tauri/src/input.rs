@@ -208,7 +208,8 @@ mod macos_impl {
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    use std::process::Command;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
 
     pub fn get_clipboard() -> Option<String> {
         let output = Command::new("wl-paste").arg("--no-newline").output().ok()?;
@@ -220,32 +221,45 @@ mod linux_impl {
     }
 
     pub fn type_text(text: &str) {
-        // Use wl-copy to set clipboard, then wtype to paste
-        let copy_result = Command::new("wl-copy").arg(text).status();
-
-        match copy_result {
-            Ok(status) if status.success() => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                let paste_result = Command::new("wtype")
-                    .arg("-M")
-                    .arg("ctrl")
-                    .arg("-k")
-                    .arg("v")
-                    .arg("-m")
-                    .arg("ctrl")
-                    .status();
-
-                if let Err(e) = paste_result {
-                    tracing::error!("wtype failed: {}", e);
-                }
-            }
-            Ok(status) => {
-                tracing::error!("wl-copy exited with: {}", status);
-            }
-            Err(e) => {
-                tracing::error!("wl-copy failed: {} (install wl-clipboard)", e);
-            }
+        // Feed stdin rather than an argv value: transcripts beginning with
+        // '-' must never be interpreted as wl-copy command-line options.
+        if let Err(e) = set_clipboard(text) {
+            tracing::error!("wl-copy failed: {:#} (install wl-clipboard)", e);
+            return;
         }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        match Command::new("wtype")
+            .arg("-M")
+            .arg("ctrl")
+            .arg("-k")
+            .arg("v")
+            .arg("-m")
+            .arg("ctrl")
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => tracing::error!("wtype exited with: {}", status),
+            Err(e) => tracing::error!("wtype failed: {} (install wtype)", e),
+        }
+    }
+
+    fn set_clipboard(text: &str) -> anyhow::Result<()> {
+        let mut child = Command::new("wl-copy")
+            .arg("--type")
+            .arg("text/plain;charset=utf-8")
+            .stdin(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("wl-copy stdin is unavailable"))?
+            .write_all(text.as_bytes())?;
+        let status = child.wait()?;
+        if !status.success() {
+            anyhow::bail!("wl-copy exited with {status}");
+        }
+        Ok(())
     }
 }
 

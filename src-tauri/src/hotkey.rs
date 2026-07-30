@@ -860,12 +860,150 @@ mod macos_impl {
 mod linux_impl {
     use super::*;
     use evdev::{Device, InputEventKind, Key};
+    use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU16;
+    use std::sync::{Mutex, OnceLock, RwLock};
 
-    fn find_keyboards() -> Vec<Device> {
+    #[derive(Debug, Clone)]
+    struct LinuxCombo {
+        /// Each inner vector contains equivalent left/right alternatives.
+        required: Vec<Vec<Key>>,
+        triggers: Vec<Key>,
+        label: String,
+    }
+
+    impl LinuxCombo {
+        fn from_combo(combo: &str) -> Option<Self> {
+            let parts: Vec<&str> = combo
+                .split('+')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .collect();
+            let (trigger, modifiers) = parts.split_last()?;
+            let required = modifiers
+                .iter()
+                .map(|token| modifier_keys(token))
+                .collect::<Option<Vec<_>>>()?;
+            let triggers = trigger_keys(trigger)?;
+            Some(Self {
+                required,
+                triggers,
+                label: combo.to_string(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct PressedKeys {
+        counts: HashMap<Key, usize>,
+    }
+
+    impl PressedKeys {
+        fn press(&mut self, key: Key) {
+            *self.counts.entry(key).or_default() += 1;
+        }
+
+        fn release(&mut self, key: Key) {
+            if let Some(count) = self.counts.get_mut(&key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.counts.remove(&key);
+                }
+            }
+        }
+
+        fn is_held(&self, key: Key) -> bool {
+            self.counts.get(&key).copied().unwrap_or(0) != 0
+        }
+    }
+
+    static HOOK_STATE: OnceLock<HotkeyState> = OnceLock::new();
+    static LINUX_COMBO: RwLock<Option<LinuxCombo>> = RwLock::new(None);
+    static TRIGGER_HELD: AtomicBool = AtomicBool::new(false);
+    static ACTIVE_TRIGGER: AtomicU16 = AtomicU16::new(0);
+
+    fn modifier_keys(token: &str) -> Option<Vec<Key>> {
+        Some(match token.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => vec![Key::KEY_LEFTCTRL, Key::KEY_RIGHTCTRL],
+            "lctrl" => vec![Key::KEY_LEFTCTRL],
+            "rctrl" => vec![Key::KEY_RIGHTCTRL],
+            "alt" | "menu" | "option" => vec![Key::KEY_LEFTALT, Key::KEY_RIGHTALT],
+            "lalt" => vec![Key::KEY_LEFTALT],
+            "ralt" => vec![Key::KEY_RIGHTALT],
+            "shift" => vec![Key::KEY_LEFTSHIFT, Key::KEY_RIGHTSHIFT],
+            "lshift" => vec![Key::KEY_LEFTSHIFT],
+            "rshift" => vec![Key::KEY_RIGHTSHIFT],
+            "win" | "meta" | "super" | "cmd" | "command" => {
+                vec![Key::KEY_LEFTMETA, Key::KEY_RIGHTMETA]
+            }
+            "lwin" => vec![Key::KEY_LEFTMETA],
+            "rwin" => vec![Key::KEY_RIGHTMETA],
+            _ => return None,
+        })
+    }
+
+    fn trigger_keys(token: &str) -> Option<Vec<Key>> {
+        if let Some(keys) = modifier_keys(token) {
+            return Some(keys);
+        }
+        let lower = token.to_ascii_lowercase();
+        let key = match lower.as_str() {
+            "space" => Key::KEY_SPACE,
+            "enter" | "return" => Key::KEY_ENTER,
+            "tab" => Key::KEY_TAB,
+            "esc" | "escape" => Key::KEY_ESC,
+            "backspace" => Key::KEY_BACKSPACE,
+            "delete" | "del" => Key::KEY_DELETE,
+            "a" => Key::KEY_A,
+            "b" => Key::KEY_B,
+            "c" => Key::KEY_C,
+            "d" => Key::KEY_D,
+            "e" => Key::KEY_E,
+            "f" => Key::KEY_F,
+            "g" => Key::KEY_G,
+            "h" => Key::KEY_H,
+            "i" => Key::KEY_I,
+            "j" => Key::KEY_J,
+            "k" => Key::KEY_K,
+            "l" => Key::KEY_L,
+            "m" => Key::KEY_M,
+            "n" => Key::KEY_N,
+            "o" => Key::KEY_O,
+            "p" => Key::KEY_P,
+            "q" => Key::KEY_Q,
+            "r" => Key::KEY_R,
+            "s" => Key::KEY_S,
+            "t" => Key::KEY_T,
+            "u" => Key::KEY_U,
+            "v" => Key::KEY_V,
+            "w" => Key::KEY_W,
+            "x" => Key::KEY_X,
+            "y" => Key::KEY_Y,
+            "z" => Key::KEY_Z,
+            "0" => Key::KEY_0,
+            "1" => Key::KEY_1,
+            "2" => Key::KEY_2,
+            "3" => Key::KEY_3,
+            "4" => Key::KEY_4,
+            "5" => Key::KEY_5,
+            "6" => Key::KEY_6,
+            "7" => Key::KEY_7,
+            "8" => Key::KEY_8,
+            "9" => Key::KEY_9,
+            _ => return None,
+        };
+        Some(vec![key])
+    }
+
+    fn find_keyboards(skip: &HashSet<PathBuf>) -> Vec<(PathBuf, Device)> {
         let mut keyboards = Vec::new();
         if let Ok(entries) = std::fs::read_dir("/dev/input") {
             for entry in entries.flatten() {
                 let path = entry.path();
+                if skip.contains(&path) {
+                    continue;
+                }
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     if !name.starts_with("event") {
                         continue;
@@ -881,7 +1019,7 @@ mod linux_impl {
                             dev.name().unwrap_or("?"),
                             path.display()
                         );
-                        keyboards.push(dev);
+                        keyboards.push((path, dev));
                     }
                 }
             }
@@ -889,76 +1027,197 @@ mod linux_impl {
         keyboards
     }
 
-    /// Linux doesn't yet honour the configurable hotkey — it stays on
-    /// Ctrl+Super (the original combo). Wire it up if/when we ship Linux.
-    pub fn set_hotkey_def(_def: HotkeyDef) {}
+    pub fn set_hotkey_def(def: HotkeyDef) {
+        let combo = LinuxCombo::from_combo(&def.combo);
+        if combo.is_none() {
+            tracing::warn!("hotkey '{}' has no Linux evdev mapping", def.combo);
+        }
+        if let Ok(mut guard) = LINUX_COMBO.write() {
+            *guard = combo;
+        }
+        if TRIGGER_HELD.swap(false, Ordering::SeqCst) {
+            ACTIVE_TRIGGER.store(0, Ordering::SeqCst);
+            if let Some(state) = HOOK_STATE.get() {
+                state.active_mode.store(MODE_IDLE, Ordering::SeqCst);
+            }
+        }
+    }
 
     pub fn install_hook(state: HotkeyState) -> anyhow::Result<HookGuard> {
-        let active_mode = state.active_mode.clone();
-        let is_recording = state.is_recording.clone();
+        let empty = HashSet::new();
+        let initial = find_keyboards(&empty);
+        if initial.is_empty() {
+            anyhow::bail!(
+                "no readable keyboard devices in /dev/input; use Hyprland press/release binds \
+                 or grant the user access through the 'input' group/udev"
+            );
+        }
+        let _ = HOOK_STATE.set(state);
 
-        let handle = std::thread::spawn(move || {
-            let keyboards = find_keyboards();
-            if keyboards.is_empty() {
-                tracing::error!("No keyboard devices found in /dev/input/");
-                return;
-            }
+        let handle = std::thread::Builder::new()
+            .name("flov-evdev-manager".into())
+            .spawn(move || {
+                let pressed = Arc::new(Mutex::new(PressedKeys::default()));
+                let active_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
 
-            let ctrl_held = Arc::new(AtomicBool::new(false));
+                for (path, device) in initial {
+                    spawn_keyboard_worker(path, device, pressed.clone(), active_paths.clone());
+                }
 
-            let mut handles = Vec::new();
-            for mut dev in keyboards {
-                let ctrl = ctrl_held.clone();
-                let mode = active_mode.clone();
-                let recording = is_recording.clone();
+                // Pick up hot-plugged keyboards and devices recreated after
+                // suspend. Workers remove their path after an evdev error.
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let skip = active_paths.lock().unwrap().clone();
+                    for (path, device) in find_keyboards(&skip) {
+                        spawn_keyboard_worker(path, device, pressed.clone(), active_paths.clone());
+                    }
+                }
+            })?;
 
-                let h = std::thread::spawn(move || loop {
-                    match dev.fetch_events() {
+        Ok(HookGuard { _handle: handle })
+    }
+
+    fn spawn_keyboard_worker(
+        path: PathBuf,
+        mut device: Device,
+        pressed: Arc<Mutex<PressedKeys>>,
+        active_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    ) {
+        if !active_paths.lock().unwrap().insert(path.clone()) {
+            return;
+        }
+        let name = device.name().unwrap_or("keyboard").to_string();
+        let thread_path = path.clone();
+        let worker_pressed = pressed.clone();
+        let worker_paths = active_paths.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("flov-evdev-keyboard".into())
+            .spawn(move || {
+                let mut local_pressed = HashSet::<Key>::new();
+                loop {
+                    match device.fetch_events() {
                         Ok(events) => {
-                            for ev in events {
-                                if let InputEventKind::Key(key) = ev.kind() {
-                                    let value = ev.value();
-                                    match key {
-                                        Key::KEY_LEFTCTRL | Key::KEY_RIGHTCTRL => {
-                                            ctrl.store(value != 0, Ordering::SeqCst);
-                                        }
-                                        Key::KEY_LEFTMETA | Key::KEY_RIGHTMETA => {
-                                            if value == 1 {
-                                                if ctrl.load(Ordering::SeqCst)
-                                                    && !recording.load(Ordering::SeqCst)
-                                                {
-                                                    tracing::info!(
-                                                        "Hotkey: Ctrl+Super (transcribe)"
-                                                    );
-                                                    mode.store(MODE_TRANSCRIBE, Ordering::SeqCst);
-                                                    recording.store(true, Ordering::SeqCst);
-                                                }
-                                            } else if value == 0 {
-                                                if mode.load(Ordering::SeqCst) == MODE_TRANSCRIBE {
-                                                    mode.store(MODE_IDLE, Ordering::SeqCst);
-                                                }
-                                            }
-                                        }
-                                        _ => {}
-                                    }
+                            for event in events {
+                                if let InputEventKind::Key(key) = event.kind() {
+                                    handle_key_event(
+                                        key,
+                                        event.value(),
+                                        &mut local_pressed,
+                                        &worker_pressed,
+                                    );
                                 }
                             }
                         }
                         Err(e) => {
-                            tracing::error!("evdev read error: {}", e);
+                            tracing::warn!(
+                                "evdev keyboard '{}' ({}) disconnected: {}",
+                                name,
+                                thread_path.display(),
+                                e
+                            );
                             break;
                         }
                     }
-                });
-                handles.push(h);
-            }
+                }
 
-            for h in handles {
-                let _ = h.join();
-            }
-        });
+                {
+                    let mut shared = worker_pressed.lock().unwrap();
+                    for key in &local_pressed {
+                        shared.release(*key);
+                    }
+                }
+                let active = ACTIVE_TRIGGER.load(Ordering::SeqCst);
+                if local_pressed.iter().any(|key| key.code() == active)
+                    && TRIGGER_HELD.swap(false, Ordering::SeqCst)
+                {
+                    ACTIVE_TRIGGER.store(0, Ordering::SeqCst);
+                    if let Some(state) = HOOK_STATE.get() {
+                        state.active_mode.store(MODE_IDLE, Ordering::SeqCst);
+                    }
+                }
+                worker_paths.lock().unwrap().remove(&thread_path);
+            });
+        if let Err(e) = spawn_result {
+            active_paths.lock().unwrap().remove(&path);
+            tracing::error!("failed to spawn evdev worker for {}: {}", path.display(), e);
+        }
+    }
 
-        Ok(HookGuard { _handle: handle })
+    fn handle_key_event(
+        key: Key,
+        value: i32,
+        local_pressed: &mut HashSet<Key>,
+        pressed: &Mutex<PressedKeys>,
+    ) {
+        if value == 1 && local_pressed.insert(key) {
+            pressed.lock().unwrap().press(key);
+        } else if value == 0 && local_pressed.remove(&key) {
+            pressed.lock().unwrap().release(key);
+        }
+
+        if value == 0
+            && ACTIVE_TRIGGER.load(Ordering::SeqCst) == key.code()
+            && TRIGGER_HELD.swap(false, Ordering::SeqCst)
+        {
+            ACTIVE_TRIGGER.store(0, Ordering::SeqCst);
+            if let Some(state) = HOOK_STATE.get() {
+                state.active_mode.store(MODE_IDLE, Ordering::SeqCst);
+            }
+            return;
+        }
+        if value != 1 || TRIGGER_HELD.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let combo_guard = match LINUX_COMBO.read() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        let Some(combo) = combo_guard.as_ref() else {
+            return;
+        };
+        if !combo.triggers.contains(&key) {
+            return;
+        }
+        let shared = pressed.lock().unwrap();
+        let modifiers_held = combo
+            .required
+            .iter()
+            .all(|alternatives| alternatives.iter().any(|key| shared.is_held(*key)));
+        drop(shared);
+        if modifiers_held {
+            TRIGGER_HELD.store(true, Ordering::SeqCst);
+            ACTIVE_TRIGGER.store(key.code(), Ordering::SeqCst);
+            if let Some(state) = HOOK_STATE.get() {
+                tracing::info!("Hotkey: {} (transcribe)", combo.label);
+                state.active_mode.store(MODE_TRANSCRIBE, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn maps_configurable_ctrl_super_combo() {
+            let combo = LinuxCombo::from_combo("Ctrl+Win").unwrap();
+
+            assert_eq!(
+                combo.required,
+                vec![vec![Key::KEY_LEFTCTRL, Key::KEY_RIGHTCTRL]]
+            );
+            assert_eq!(combo.triggers, vec![Key::KEY_LEFTMETA, Key::KEY_RIGHTMETA]);
+        }
+
+        #[test]
+        fn maps_right_ctrl_as_a_single_trigger() {
+            let combo = LinuxCombo::from_combo("RCtrl").unwrap();
+
+            assert!(combo.required.is_empty());
+            assert_eq!(combo.triggers, vec![Key::KEY_RIGHTCTRL]);
+        }
     }
 }
 

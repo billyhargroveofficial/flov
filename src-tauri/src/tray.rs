@@ -24,7 +24,7 @@ pub enum TrayState {
 impl TrayState {
     fn tooltip(self) -> &'static str {
         match self {
-            TrayState::Idle => "flov — hold Ctrl+Win to dictate",
+            TrayState::Idle => "flov — hold the hotkey to dictate",
             TrayState::Recording => "flov — recording…",
             TrayState::Transcribing => "flov — transcribing…",
         }

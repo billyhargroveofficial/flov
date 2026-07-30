@@ -14,6 +14,8 @@ pub struct Config {
     pub backend: BackendConfig,
     #[serde(default)]
     pub hotkey: HotkeyConfig,
+    #[serde(default)]
+    pub server: ServerConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -35,12 +37,73 @@ fn default_hotkey_combo() -> String {
     // like Ctrl+Cmd+Q = lock screen and Ctrl+Cmd+Space = emoji picker).
     #[cfg(target_os = "macos")]
     {
-        return "Cmd+Alt".to_string();
+        "Cmd+Alt".to_string()
     }
-    #[cfg(not(target_os = "macos"))]
+    // A right-side modifier is a convenient push-to-talk key and does not
+    // collide with Hyprland's usual Super-based compositor shortcuts.
+    #[cfg(target_os = "linux")]
+    {
+        "RCtrl".to_string()
+    }
+    #[cfg(target_os = "windows")]
     {
         "Ctrl+Win".to_string()
     }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        "Ctrl+Win".to_string()
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ServerConfig {
+    /// Starts the local OpenAI-compatible HTTP API.
+    #[serde(default = "default_server_enabled")]
+    pub enabled: bool,
+    /// Socket address only (hostnames are intentionally not accepted).
+    #[serde(default = "default_server_bind")]
+    pub bind: String,
+    /// Optional bearer token. It is mandatory when binding beyond loopback.
+    #[serde(default)]
+    pub api_key: String,
+    /// Maximum encoded request body size.
+    #[serde(default = "default_server_max_body_mb")]
+    pub max_body_mb: u64,
+    /// Maximum decoded audio duration.
+    #[serde(default = "default_server_max_audio_seconds")]
+    pub max_audio_seconds: u64,
+    /// Apply the configured OpenRouter cleanup unless a request overrides it.
+    #[serde(default)]
+    pub postprocess: bool,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_server_enabled(),
+            bind: default_server_bind(),
+            api_key: String::new(),
+            max_body_mb: default_server_max_body_mb(),
+            max_audio_seconds: default_server_max_audio_seconds(),
+            postprocess: false,
+        }
+    }
+}
+
+fn default_server_enabled() -> bool {
+    true
+}
+
+fn default_server_bind() -> String {
+    "127.0.0.1:17432".to_string()
+}
+
+fn default_server_max_body_mb() -> u64 {
+    25
+}
+
+fn default_server_max_audio_seconds() -> u64 {
+    10 * 60
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -163,6 +226,7 @@ impl Config {
                 openrouter: OpenRouterConfig::default(),
                 backend: BackendConfig::default(),
                 hotkey: HotkeyConfig::default(),
+                server: ServerConfig::default(),
             });
         }
 

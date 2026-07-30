@@ -5,3 +5,23 @@ language = "ru"
 
 [audio]
 sample_rate = 16000
+
+[hotkey]
+# Linux default is RCtrl; Windows default is Ctrl+Win; macOS is Cmd+Alt.
+# On Hyprland the compositor press/release binding from docs/LINUX.md is
+# preferred. This value controls the evdev fallback.
+combo = "RCtrl"
+
+[server]
+# OpenAI-compatible endpoint:
+# POST http://127.0.0.1:17432/v1/audio/transcriptions
+enabled = true
+bind = "127.0.0.1:17432"
+api_key = ""
+max_body_mb = 25
+max_audio_seconds = 600
+postprocess = false
+
+# For LAN clients, bind to 0.0.0.0 and always set a strong token:
+# bind = "0.0.0.0:17432"
+# api_key = "replace-with-a-long-random-token"

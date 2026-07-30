@@ -47,6 +47,10 @@ fn error_text() -> &'static Mutex<String> {
     PILL_ERROR_TEXT.get_or_init(|| Mutex::new(String::new()))
 }
 
+fn pill_hide_allowed(cycle_active: bool, pill_state: PillState) -> bool {
+    !cycle_active || matches!(pill_state, PillState::Error)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -494,10 +498,20 @@ pub fn pill_snapshot() -> PillSnapshot {
 /// `{#if}` unmount; the OS window remains transparent and click-through.
 #[tauri::command]
 pub fn hide_window(window: tauri::WebviewWindow) {
-    if recording_cycle_active() {
-        tracing::info!("logical pill hide received while a recording cycle is active");
-    } else {
+    let cycle_active = recording_cycle_active();
+    let pill_state = PillState::from_u8(PILL_STATE.load(Ordering::SeqCst));
+    // An error can be raised before recording starts at all (for example,
+    // when no model is installed). Its frontend timer may expire while the
+    // hotkey is still held. Hiding that error is safe; blocking it forever
+    // leaves the whole Wayland surface mapped after key release. A stale
+    // idle timer from an earlier cycle is still rejected once the new cycle
+    // has switched the pill to Recording/Transcribing.
+    let can_hide = pill_hide_allowed(cycle_active, pill_state);
+
+    if can_hide {
         set_pill_state(PillState::Idle);
+    } else {
+        tracing::info!("logical pill hide received while a recording cycle is active");
     }
     set_overlay_active(false);
     #[cfg(target_os = "windows")]
@@ -508,6 +522,28 @@ pub fn hide_window(window: tauri::WebviewWindow) {
         }
         force_repaint(&window);
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    if can_hide {
+        if let Err(e) = window.hide() {
+            tracing::warn!("Linux pill window.hide() failed: {}", e);
+        }
+    }
+    #[cfg(target_os = "macos")]
     let _ = window;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pill_hide_allowed, PillState};
+
+    #[test]
+    fn active_error_can_finish_its_hide_timer() {
+        assert!(pill_hide_allowed(true, PillState::Error));
+    }
+
+    #[test]
+    fn stale_hide_timer_cannot_hide_a_new_recording() {
+        assert!(!pill_hide_allowed(true, PillState::Recording));
+        assert!(!pill_hide_allowed(true, PillState::Transcribing));
+    }
 }

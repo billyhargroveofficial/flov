@@ -1,6 +1,8 @@
 // Domain modules from existing flov.
+pub mod api;
 pub mod audio;
 pub mod config;
+pub mod control;
 pub mod hotkey;
 pub mod input;
 pub mod models;
@@ -30,6 +32,20 @@ fn configure_webview2_environment() {
 
 #[cfg(not(target_os = "windows"))]
 fn configure_webview2_environment() {}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_webkit_environment() {
+    // WebKitGTK's DMA-BUF renderer currently trips Hyprland's explicit-sync
+    // protocol on NVIDIA ("Missing acquire timeline") when the hidden pill is
+    // first mapped. WebKit provides this software-buffer fallback itself.
+    // Respect an explicit user override for future driver/WebKit versions.
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_linux_webkit_environment() {}
 
 /// Open `flov.log` next to the running exe (not CWD — CWD changes when
 /// the app is launched from elsewhere) in append mode so logs survive
@@ -78,14 +94,22 @@ fn init_logging() {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     configure_webview2_environment();
+    configure_linux_webkit_environment();
     init_logging();
     tracing::info!("flov starting (Tauri)");
 
     let cfg = config::Config::load().expect("config load failed");
-    let recorder = Arc::new(
-        audio::AudioRecorder::new(cfg.audio.sample_rate, cfg.audio.device.as_deref())
-            .expect("audio init failed"),
-    );
+    let recorder =
+        match audio::AudioRecorder::new(cfg.audio.sample_rate, cfg.audio.device.as_deref()) {
+            Ok(recorder) => Some(Arc::new(recorder)),
+            Err(e) => {
+                tracing::error!(
+                    "local audio input unavailable; HTTP transcription remains active: {:#}",
+                    e
+                );
+                None
+            }
+        };
 
     // Shared mutable backend + model — written by the tray/Models window,
     // read by the Transcriber on every transcribe() call so a switch takes
@@ -135,14 +159,25 @@ pub fn run() {
     let hotkey_state = hotkey::HotkeyState::new();
     let active_mode = hotkey_state.active_mode.clone();
     let is_recording = hotkey_state.is_recording.clone();
-    let _hook = hotkey::install_hook(hotkey_state).expect("hotkey hook failed");
+    let _hook = match hotkey::install_hook(hotkey_state) {
+        Ok(hook) => Some(hook),
+        Err(e) => {
+            tracing::error!(
+                "global hotkey unavailable; Hyprland control/API remains active: {:#}",
+                e
+            );
+            None
+        }
+    };
 
     // Set the initial hotkey definition; Tauri command can swap it later.
     // Fallback combo is per-platform so Mac users don't get Ctrl+Cmd (=
     // collides with system shortcuts like Ctrl+Cmd+Q lock screen).
     #[cfg(target_os = "macos")]
     let fallback_combo = "Cmd+Alt";
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    let fallback_combo = "RCtrl";
+    #[cfg(target_os = "windows")]
     let fallback_combo = "Ctrl+Win";
     let initial_def = hotkey::HotkeyDef::parse(&cfg.hotkey.combo).unwrap_or_else(|e| {
         tracing::warn!(
@@ -170,9 +205,10 @@ pub fn run() {
     };
 
     let stats_for_loop = stats.clone();
-    let sample_rate_for_loop = recorder.output_sample_rate();
+    let sample_rate_for_loop = audio::TRANSCRIBE_SAMPLE_RATE;
+    let server_config = cfg.server.clone();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(model_state)
         .manage(app_state)
@@ -188,9 +224,25 @@ pub fn run() {
             let app_handle = app.handle().clone();
             let window = app.get_webview_window("main").expect("main window missing");
 
-            // Click-through is set both via Tauri (works on Windows) and as a
-            // belt-and-suspenders Win32 fallback, mirroring the verified POC.
+            // On native Wayland the initially hidden GTK window has no
+            // GdkWindow yet, so tao's generic click-through call panics.
+            // Linux installs its input region from GTK's map-event below;
+            // Win32 and AppKit can apply click-through immediately.
+            #[cfg(not(target_os = "linux"))]
             let _ = window.set_ignore_cursor_events(true);
+            #[cfg(target_os = "linux")]
+            {
+                // tao's generic implementation uses a 1x1 input region and
+                // can violate the Wayland protocol. GTK can set a genuinely
+                // empty region safely once the surface receives map-event.
+                use gtk::prelude::{WidgetExt, WidgetExtManual};
+                let gtk_window = window.gtk_window()?;
+                gtk_window.connect_map_event(|widget, _| {
+                    let empty_region = gtk::cairo::Region::create();
+                    widget.input_shape_combine_region(Some(&empty_region));
+                    gtk::glib::Propagation::Proceed
+                });
+            }
             #[cfg(target_os = "windows")]
             {
                 ui::force_click_through(&window);
@@ -198,6 +250,19 @@ pub fn run() {
             }
 
             tray::setup(&app_handle)?;
+
+            if let Err(e) = api::spawn(
+                server_config.clone(),
+                api::ApiRuntime {
+                    app: app_handle.clone(),
+                    transcriber: transcriber.clone(),
+                    post_processor: post_processor.clone(),
+                    stats: stats_for_loop.clone(),
+                    active_mode: active_mode.clone(),
+                },
+            ) {
+                tracing::error!("HTTP API did not start: {:#}", e);
+            }
 
             // Spawn the recording orchestration thread; it owns the recorder
             // loop and emits state/amplitude events to the webview.
@@ -252,6 +317,18 @@ pub fn run() {
             state_cmd::set_audio_input,
             state_cmd::get_stats,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|_, event| {
+        if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+            // GTK requests a process exit when the last visible window is
+            // hidden. Flov is a tray/server application, so keep it alive for
+            // the next Hyprland press. Explicit tray quit/app.exit carries an
+            // exit code and is allowed through.
+            if code.is_none() {
+                api.prevent_exit();
+            }
+        }
+    });
 }
