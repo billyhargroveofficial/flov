@@ -155,6 +155,7 @@ fn recording_loop(runtime: RecordingRuntime) {
 
         let model_present = transcriber.has_model();
         if !model_present {
+            transcriber.discard_prepared("PTT started without a model");
             show_pill_window(&app, true);
             emit_transcribe_error(&app, "Скачай модель: Settings → Models");
             tracing::warn!("hotkey pressed but no model is configured");
@@ -164,6 +165,7 @@ fn recording_loop(runtime: RecordingRuntime) {
         }
 
         let Some(recorder) = recorder.as_ref() else {
+            transcriber.discard_prepared("PTT started without an audio device");
             show_pill_window(&app, true);
             emit_transcribe_error(&app, "Микрофон недоступен — проверь PipeWire/ALSA");
             tracing::warn!("hotkey pressed but no local audio input is available");
@@ -171,6 +173,17 @@ fn recording_loop(runtime: RecordingRuntime) {
             wait_for_hotkey_release(&active_mode);
             continue;
         };
+
+        // CUDA sidecars load the Whisper context before reading stdin. Start
+        // that work on PTT-down so it overlaps capture, then transcribe()
+        // consumes this exact child on release. Failure is non-fatal: the
+        // normal fresh-sidecar path remains available on release.
+        if let Err(e) = transcriber.prepare() {
+            tracing::warn!(
+                "CUDA prewarm phase=unavailable; will use fresh sidecar: {:#}",
+                e
+            );
+        }
 
         show_pill_window(&app, true);
         emit_state(&app, ui::PillState::Recording);
@@ -187,6 +200,7 @@ fn recording_loop(runtime: RecordingRuntime) {
         ) {
             Ok(samples) => samples,
             Err(e) => {
+                transcriber.discard_prepared("audio capture failed");
                 tracing::error!("audio recording failed: {:#}", e);
                 emit_transcribe_error(&app, &format!("Audio error: {e:#}"));
                 tray::set_state(&app, tray::TrayState::Idle);
@@ -204,6 +218,7 @@ fn recording_loop(runtime: RecordingRuntime) {
         );
 
         if samples.len() < 1600 {
+            transcriber.discard_prepared("PTT recording shorter than 100ms");
             emit_state(&app, ui::PillState::Idle);
             tray::set_state(&app, tray::TrayState::Idle);
             continue;

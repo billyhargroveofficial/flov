@@ -228,7 +228,10 @@ mod linux_impl {
             return;
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // `wl-copy` exits only after its selection callback has completed a
+        // Wayland round-trip, so the compositor has accepted this clipboard
+        // owner. Do not add a delay here: it only increases release-to-paste
+        // latency and does not make the selection any more ready.
         match Command::new("wtype")
             .arg("-M")
             .arg("ctrl")
