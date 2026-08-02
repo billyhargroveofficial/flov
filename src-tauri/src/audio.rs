@@ -3,9 +3,17 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SizedSample};
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const SPECTRUM_FFT_SIZE: usize = 2048;
 const SPECTRUM_BANDS: usize = 20;
+/// The UI has no benefit from more frequent IPC spectrum updates.
+const SPECTRUM_EMIT_INTERVAL: Duration = Duration::from_millis(60);
+/// `should_continue` is backed by the hotkey state.  Keep checking it while
+/// waiting for the next spectrum update so releasing PTT does not inherit the
+/// whole spectrum cadence as stop latency.  This remains a sleeping wait, not
+/// a spin loop.
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(4);
 pub const TRANSCRIBE_SAMPLE_RATE: u32 = 16_000;
 
 pub struct AudioRecorder {
@@ -202,46 +210,72 @@ impl AudioRecorder {
         let mut fft_samples = [0.0f32; SPECTRUM_FFT_SIZE];
         let mut complex_buf = vec![Complex::new(0.0, 0.0); SPECTRUM_FFT_SIZE];
 
-        while should_continue() {
-            let has_full_window = {
-                let capture = capture.lock().unwrap();
-                capture.spectrum.copy_ordered_into(&mut fft_samples)
-            };
+        let capture_started = Instant::now();
+        let mut next_spectrum_at = capture_started;
+        let mut spectrum_emissions = 0u64;
 
-            if has_full_window {
-                for (slot, (&sample, &window)) in complex_buf
-                    .iter_mut()
-                    .zip(fft_samples.iter().zip(hann_window.iter()))
-                {
-                    *slot = Complex::new(sample * window, 0.0);
-                }
-                fft.process(&mut complex_buf);
-
-                let mut bands = [0.0f32; SPECTRUM_BANDS];
-                let bin_count = SPECTRUM_FFT_SIZE / 2;
-                for (i, c) in complex_buf[..bin_count].iter().enumerate() {
-                    let mag = c.norm() / SPECTRUM_FFT_SIZE as f32;
-                    let freq_ratio = (i as f32 + 1.0) / bin_count as f32;
-                    let band_idx = ((freq_ratio.ln() + 5.0) / 5.0 * SPECTRUM_BANDS as f32) as usize;
-                    let band_idx = band_idx.min(SPECTRUM_BANDS - 1);
-                    bands[band_idx] = bands[band_idx].max(mag);
-                }
-
-                let max_val = bands.iter().cloned().fold(0.0f32, f32::max).max(0.001);
-                let spectrum: Vec<f32> = bands
-                    .iter()
-                    .map(|&b| (b / max_val * 3.0).min(1.0))
-                    .collect();
-
-                on_spectrum(spectrum);
+        loop {
+            if !should_continue() {
+                break;
             }
-            // ~16 Hz emit rate. The wave looks smooth at this cadence,
-            // and over a multi-hour session it halves the IPC traffic
-            // toward the webview — relevant because Tauri's event
-            // channel doesn't shed load and can back up if the JS
-            // listener falls behind.
-            std::thread::sleep(std::time::Duration::from_millis(60));
+
+            let now = Instant::now();
+            if now >= next_spectrum_at {
+                let has_full_window = {
+                    let capture = capture.lock().unwrap();
+                    capture.spectrum.copy_ordered_into(&mut fft_samples)
+                };
+
+                if has_full_window {
+                    for (slot, (&sample, &window)) in complex_buf
+                        .iter_mut()
+                        .zip(fft_samples.iter().zip(hann_window.iter()))
+                    {
+                        *slot = Complex::new(sample * window, 0.0);
+                    }
+                    fft.process(&mut complex_buf);
+
+                    let mut bands = [0.0f32; SPECTRUM_BANDS];
+                    let bin_count = SPECTRUM_FFT_SIZE / 2;
+                    for (i, c) in complex_buf[..bin_count].iter().enumerate() {
+                        let mag = c.norm() / SPECTRUM_FFT_SIZE as f32;
+                        let freq_ratio = (i as f32 + 1.0) / bin_count as f32;
+                        let band_idx =
+                            ((freq_ratio.ln() + 5.0) / 5.0 * SPECTRUM_BANDS as f32) as usize;
+                        let band_idx = band_idx.min(SPECTRUM_BANDS - 1);
+                        bands[band_idx] = bands[band_idx].max(mag);
+                    }
+
+                    let max_val = bands.iter().cloned().fold(0.0f32, f32::max).max(0.001);
+                    let spectrum: Vec<f32> = bands
+                        .iter()
+                        .map(|&b| (b / max_val * 3.0).min(1.0))
+                        .collect();
+
+                    on_spectrum(spectrum);
+                    spectrum_emissions += 1;
+                }
+
+                // Keep a stable ~16 Hz ceiling, including while the ring is
+                // filling. Scheduling from `now` also avoids bursty catch-up
+                // events if the thread was descheduled.
+                next_spectrum_at = Instant::now() + SPECTRUM_EMIT_INTERVAL;
+            }
+
+            // Do not sleep until the next UI update in one shot: that used to
+            // add a guaranteed 0–60 ms to every hotkey release.  The callback
+            // continues independently; this only controls the orchestration
+            // thread's polling cadence.
+            let until_spectrum = next_spectrum_at.saturating_duration_since(Instant::now());
+            std::thread::sleep(next_capture_poll_wait(until_spectrum));
         }
+
+        tracing::debug!(
+            elapsed = ?capture_started.elapsed(),
+            spectrum_emissions,
+            stop_poll_ms = STOP_POLL_INTERVAL.as_millis(),
+            "audio capture stop observed"
+        );
 
         drop(stream);
 
@@ -257,6 +291,10 @@ impl AudioRecorder {
             Ok(samples)
         }
     }
+}
+
+fn next_capture_poll_wait(until_spectrum: Duration) -> Duration {
+    until_spectrum.min(STOP_POLL_INTERVAL)
 }
 
 fn build_input_stream<T>(
@@ -367,5 +405,17 @@ mod tests {
         assert!(ring.copy_ordered_into(&mut out));
         assert_eq!(out[0], 3.0);
         assert_eq!(out[SPECTRUM_FFT_SIZE - 1], (SPECTRUM_FFT_SIZE + 2) as f32);
+    }
+
+    #[test]
+    fn capture_poll_wait_caps_stop_latency_without_exceeding_spectrum_deadline() {
+        assert_eq!(
+            next_capture_poll_wait(Duration::from_millis(60)),
+            STOP_POLL_INTERVAL
+        );
+        assert_eq!(
+            next_capture_poll_wait(Duration::from_millis(2)),
+            Duration::from_millis(2)
+        );
     }
 }

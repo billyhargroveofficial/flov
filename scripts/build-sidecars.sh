@@ -88,7 +88,17 @@ build_one() {
     if [[ "$profile" == "release" ]]; then
         args+=(--release)
     fi
-    cargo "${args[@]}"
+    if [[ "$name" == "cuda" ]]; then
+        # Build only the native GPU's real cubin so CUDA does not JIT PTX on
+        # the first PTT. `speed` keeps CUDA fatbin code uncompressed; on the
+        # local RTX 3080 Ti it costs ~84 MiB on disk but lowers cold p95.
+        # Both values remain overridable for portable/release builds.
+        CMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES:-native}" \
+            GGML_CUDA_COMPRESSION_MODE="${GGML_CUDA_COMPRESSION_MODE:-speed}" \
+            cargo "${args[@]}"
+    else
+        cargo "${args[@]}"
+    fi
 
     local exe="$target_dir/$profile/flov-whisper-$name"
     if [[ ! -f "$exe" ]]; then

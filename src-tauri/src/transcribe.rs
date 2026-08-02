@@ -11,9 +11,10 @@
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use wait_timeout::ChildExt;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -95,6 +96,30 @@ pub struct Transcriber {
     /// Serialize local hotkey and HTTP requests so simultaneous calls cannot
     /// race into OOM or contend on the same accelerator.
     inference_lock: Mutex<()>,
+    /// A CUDA sidecar started on PTT-down. It owns VRAM only while the
+    /// hotkey is held, then gets consumed (or killed) on PTT-up.
+    prepared: Mutex<Option<PreparedSidecar>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidecarSpec {
+    backend: String,
+    sidecar: PathBuf,
+    model_path: PathBuf,
+    language: String,
+}
+
+struct RunningSidecar {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout_thread: Option<std::thread::JoinHandle<std::io::Result<String>>>,
+    stderr_thread: Option<std::thread::JoinHandle<String>>,
+}
+
+struct PreparedSidecar {
+    spec: SidecarSpec,
+    running: RunningSidecar,
+    spawned_at: Instant,
 }
 
 impl Transcriber {
@@ -112,6 +137,7 @@ impl Transcriber {
             language,
             backend_choice,
             inference_lock: Mutex::new(()),
+            prepared: Mutex::new(None),
         })
     }
 
@@ -126,8 +152,165 @@ impl Transcriber {
         &self.language
     }
 
+    /// Start the configured CUDA sidecar when PTT is pressed. The sidecar
+    /// initializes its Whisper context before it starts consuming stdin, so
+    /// this overlaps model loading with microphone capture. Nothing is kept
+    /// alive in idle: recording.rs always consumes or discards this child on
+    /// the matching PTT release.
+    pub fn prepare(&self) -> Result<()> {
+        // This fast path is deliberately Linux-only until it has been tuned
+        // and regression-tested independently on the other platforms.
+        if !cfg!(target_os = "linux") {
+            return Ok(());
+        }
+
+        // Do not load a second GPU context while an HTTP/explicit request is
+        // already using the serialized inference path. A missed prewarm only
+        // falls back to the normal fresh spawn on PTT-up.
+        let _inference_guard = match self.inference_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::info!("CUDA prewarm phase=skipped inference already active");
+                return Ok(());
+            }
+        };
+
+        // A previous PTT cycle must never leave a CUDA model resident. This
+        // also handles a backend/model/language switch between two presses.
+        self.discard_prepared("superseded by a new PTT press");
+
+        let spec = self.current_spec(&self.language)?;
+
+        if spec.backend != "cuda" {
+            tracing::debug!(
+                "CUDA prewarm phase=skipped backend={} model={:?}",
+                spec.backend,
+                spec.model_path
+            );
+            return Ok(());
+        }
+
+        let start = Instant::now();
+        tracing::info!(
+            "CUDA prewarm phase=spawn model={:?} language={} sidecar={:?}",
+            spec.model_path,
+            spec.language,
+            spec.sidecar
+        );
+        let running = RunningSidecar::spawn(&spec, true, true)?;
+        let prepared = PreparedSidecar {
+            spec,
+            running,
+            spawned_at: Instant::now(),
+        };
+        *self.prepared.lock().unwrap() = Some(prepared);
+        tracing::info!("CUDA prewarm phase=spawned elapsed={:?}", start.elapsed());
+        Ok(())
+    }
+
+    /// Release a prepared CUDA child without transcribing. This is used for
+    /// capture failures and very short PTT taps so VRAM is returned promptly.
+    pub fn discard_prepared(&self, reason: &str) {
+        let prepared = self.prepared.lock().unwrap().take();
+        if let Some(prepared) = prepared {
+            tracing::info!(
+                "CUDA prewarm phase=discard reason={} held_for={:?}",
+                reason,
+                prepared.spawned_at.elapsed()
+            );
+            prepared.running.terminate(reason);
+        }
+    }
+
     pub fn transcribe(&self, samples: &[f32]) -> Result<String> {
-        self.transcribe_with_language(samples, None)
+        let _inference_guard = self.inference_lock.lock().unwrap();
+        let total_start = Instant::now();
+        let spec = match self.current_spec(&self.language) {
+            Ok(spec) => spec,
+            Err(error) => {
+                self.discard_prepared("PTT release could not resolve current configuration");
+                return Err(error);
+            }
+        };
+
+        let prepared = self.prepared.lock().unwrap().take();
+        if let Some(prepared) = prepared {
+            if prepared.spec == spec {
+                let held_for = prepared.spawned_at.elapsed();
+                tracing::info!(
+                    "CUDA prewarm phase=reuse held_for={:?} samples={}",
+                    held_for,
+                    samples.len()
+                );
+                let timeout = transcription_timeout(samples.len());
+                let attempt_start = Instant::now();
+                let text = match prepared.running.finish(samples, timeout) {
+                    Ok(text) => text,
+                    Err(prewarm_error) => {
+                        // spawn() only proves that the process was created;
+                        // CUDA/model initialization happens asynchronously
+                        // while recording. If it died in that interval, make
+                        // one normal cold attempt so a transient prewarm
+                        // failure does not throw away the spoken phrase.
+                        tracing::warn!(
+                            "CUDA prewarm phase=failed; retrying fresh sidecar: {:#}",
+                            prewarm_error
+                        );
+                        let retry_timeout = timeout.saturating_sub(attempt_start.elapsed());
+                        let retry = if retry_timeout.is_zero() {
+                            Err(anyhow::anyhow!(
+                                "prepared sidecar exhausted the transcription deadline"
+                            ))
+                        } else {
+                            RunningSidecar::spawn(&spec, true, false)
+                                .and_then(|running| running.finish(samples, retry_timeout))
+                        };
+                        match retry {
+                            Ok(text) => text,
+                            Err(retry_error) => {
+                                anyhow::bail!(
+                                    "prepared CUDA sidecar failed: {prewarm_error:#}; fresh retry failed: {retry_error:#}"
+                                );
+                            }
+                        }
+                    }
+                };
+                tracing::info!(
+                    "CUDA prewarm phase=complete total={:?} chars={}",
+                    total_start.elapsed(),
+                    text.chars().count()
+                );
+                return Ok(text);
+            }
+
+            tracing::info!(
+                "CUDA prewarm phase=discard-mismatch prepared_backend={} current_backend={} prepared_model={:?} current_model={:?} prepared_language={} current_language={}",
+                prepared.spec.backend,
+                spec.backend,
+                prepared.spec.model_path,
+                spec.model_path,
+                prepared.spec.language,
+                spec.language,
+            );
+            prepared
+                .running
+                .terminate("PTT release configuration mismatch");
+        }
+
+        tracing::info!(
+            "transcribe phase=fresh-spawn backend={} model={:?} language={}",
+            spec.backend,
+            spec.model_path,
+            spec.language
+        );
+        let text = RunningSidecar::spawn(&spec, true, false)?
+            .finish(samples, transcription_timeout(samples.len()))?;
+        tracing::info!(
+            "transcribe phase=fresh-complete total={:?} chars={}",
+            total_start.elapsed(),
+            text.chars().count()
+        );
+        Ok(text)
     }
 
     /// Transcribe with an optional per-request ISO language code. The desktop
@@ -139,7 +322,31 @@ impl Transcriber {
         language: Option<&str>,
     ) -> Result<String> {
         let _inference_guard = self.inference_lock.lock().unwrap();
+        // The PTT prewarm is intentionally private to the currently-held
+        // hotkey. An API request must not run a second GPU sidecar alongside
+        // it, so it evicts the prepared child before its own fresh request.
+        self.discard_prepared("superseded by HTTP or explicit-language request");
         let total_start = Instant::now();
+        let request_language = language.unwrap_or(&self.language);
+        let spec = self.current_spec(request_language)?;
+        tracing::info!(
+            "transcribe phase=http-or-explicit-language backend={} model={:?} sidecar={:?} language={}",
+            spec.backend,
+            spec.model_path,
+            spec.sidecar,
+            spec.language
+        );
+        let text = RunningSidecar::spawn(&spec, false, false)?
+            .finish(samples, transcription_timeout(samples.len()))?;
+        tracing::info!(
+            "transcribe phase=http-or-explicit-language-complete total={:?} chars={}",
+            total_start.elapsed(),
+            text.chars().count()
+        );
+        Ok(text)
+    }
+
+    fn current_spec(&self, language: &str) -> Result<SidecarSpec> {
         let choice = self.backend_choice.lock().unwrap().clone();
         let (backend, sidecar) = resolve_sidecar(&choice)?;
         let model_path = self.model_path.lock().unwrap().clone();
@@ -149,29 +356,50 @@ impl Transcriber {
                 model_path
             );
         }
-        tracing::info!(
-            "transcribe via {} | model={:?} | sidecar={:?} | language={}",
+        Ok(SidecarSpec {
             backend,
-            model_path,
             sidecar,
-            language.unwrap_or(&self.language)
-        );
+            model_path,
+            language: language.to_string(),
+        })
+    }
+}
 
-        let mut cmd = Command::new(&sidecar);
+impl Drop for Transcriber {
+    fn drop(&mut self) {
+        if let Some(prepared) = self.prepared.get_mut().unwrap().take() {
+            prepared.running.terminate("transcriber dropped");
+        }
+    }
+}
+
+impl RunningSidecar {
+    fn spawn(spec: &SidecarSpec, ptt_request: bool, ptt_prewarm: bool) -> Result<Self> {
+        let mut cmd = Command::new(&spec.sidecar);
         cmd.arg("--model")
-            .arg(&model_path)
+            .arg(&spec.model_path)
             .arg("--language")
-            .arg(language.unwrap_or(&self.language))
+            .arg(&spec.language)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if cfg!(target_os = "linux") && ptt_request && spec.backend == "cuda" {
+            // These defaults are tuned for low-latency local dictation on the
+            // current Ryzen 5950X / RTX 3080 Ti. Explicit user environment
+            // values always win, which keeps every knob independently A/B
+            // testable without a rebuild.
+            set_default_child_env(&mut cmd, "FLOV_WHISPER_THREADS", "8");
+            if ptt_prewarm {
+                set_default_child_env(&mut cmd, "FLOV_PTT_PREWARM", "1");
+            }
+        }
 
         #[cfg(target_os = "windows")]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
         let mut child = cmd
             .spawn()
-            .with_context(|| format!("failed to spawn sidecar: {:?}", sidecar))?;
+            .with_context(|| format!("failed to spawn sidecar: {:?}", spec.sidecar))?;
 
         let mut stdout = child.stdout.take().context("sidecar stdout missing")?;
         let stdout_thread = std::thread::spawn(move || {
@@ -186,8 +414,18 @@ impl Transcriber {
             buf
         });
 
-        let timeout = transcription_timeout(samples.len());
-        let mut stdin = child.stdin.take().context("sidecar stdin missing")?;
+        let stdin = child.stdin.take().context("sidecar stdin missing")?;
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            stdout_thread: Some(stdout_thread),
+            stderr_thread: Some(stderr_thread),
+        })
+    }
+
+    fn finish(mut self, samples: &[f32], timeout: Duration) -> Result<String> {
+        let total_start = Instant::now();
+        let mut stdin = self.stdin.take().context("sidecar stdin missing")?;
         let write_start = Instant::now();
         let (status, write_result, timed_out) = std::thread::scope(|scope| -> Result<_> {
             let stdin_thread = scope.spawn(move || {
@@ -197,21 +435,20 @@ impl Transcriber {
                 result
             });
 
-            let mut timed_out = false;
-            let status = loop {
-                if let Some(status) = child.try_wait().context("sidecar wait failed")? {
-                    break status;
+            let status = self
+                .child
+                .wait_timeout(timeout)
+                .context("sidecar wait with timeout failed")?;
+            let timed_out = status.is_none();
+            let status = match status {
+                Some(status) => status,
+                None => {
+                    tracing::error!("sidecar timed out after {:?}; killing process", timeout);
+                    let _ = self.child.kill();
+                    self.child
+                        .wait()
+                        .context("sidecar wait after kill failed")?
                 }
-                if total_start.elapsed() > timeout {
-                    timed_out = true;
-                    tracing::error!(
-                        "sidecar timed out after {:?}; killing process",
-                        total_start.elapsed()
-                    );
-                    let _ = child.kill();
-                    break child.wait().context("sidecar wait after kill failed")?;
-                }
-                std::thread::sleep(Duration::from_millis(50));
             };
 
             let write_result = stdin_thread
@@ -226,12 +463,20 @@ impl Transcriber {
         );
 
         if timed_out {
-            let stdout_text = stdout_thread
+            let stdout_text = self
+                .stdout_thread
+                .take()
+                .expect("sidecar stdout reader missing")
                 .join()
                 .ok()
                 .and_then(|result| result.ok())
                 .unwrap_or_default();
-            let stderr_text = stderr_thread.join().unwrap_or_default();
+            let stderr_text = self
+                .stderr_thread
+                .take()
+                .expect("sidecar stderr reader missing")
+                .join()
+                .unwrap_or_default();
             anyhow::bail!(
                 "sidecar timed out after {:?}; stdout: {}; stderr: {}",
                 timeout,
@@ -240,11 +485,19 @@ impl Transcriber {
             );
         }
 
-        let stdout_buf = stdout_thread
+        let stdout_buf = self
+            .stdout_thread
+            .take()
+            .expect("sidecar stdout reader missing")
             .join()
             .map_err(|_| anyhow::anyhow!("sidecar stdout reader panicked"))?
             .context("failed to read sidecar stdout")?;
-        let stderr_text = stderr_thread.join().unwrap_or_default();
+        let stderr_text = self
+            .stderr_thread
+            .take()
+            .expect("sidecar stderr reader missing")
+            .join()
+            .unwrap_or_default();
 
         if let Err(e) = write_result {
             anyhow::bail!(
@@ -260,28 +513,118 @@ impl Transcriber {
                 stderr_text.trim()
             );
         }
-        if !stderr_text.trim().is_empty() {
-            tracing::debug!("sidecar stderr: {}", stderr_text.trim());
-        }
+        log_sidecar_diagnostics(&stderr_text);
         tracing::info!("transcription took {:?}", total_start.elapsed());
+        tracing::info!("sidecar phase=finished elapsed={:?}", total_start.elapsed());
         Ok(stdout_buf.trim().to_string())
+    }
+
+    fn terminate(mut self, reason: &str) {
+        // Closing stdin first lets a sidecar which already completed loading
+        // exit naturally. Kill is still required while CUDA is initializing.
+        drop(self.stdin.take());
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(error) = self.child.kill() {
+                    tracing::debug!("sidecar prewarm kill failed reason={}: {}", reason, error);
+                }
+                if let Err(error) = self.child.wait() {
+                    tracing::debug!("sidecar prewarm wait failed reason={}: {}", reason, error);
+                }
+            }
+            Err(error) => tracing::debug!(
+                "sidecar prewarm try_wait failed reason={}: {}",
+                reason,
+                error
+            ),
+        }
+        if let Some(stdout_thread) = self.stdout_thread.take() {
+            let _ = stdout_thread.join();
+        }
+        if let Some(stderr_thread) = self.stderr_thread.take() {
+            if let Ok(stderr_text) = stderr_thread.join() {
+                log_sidecar_diagnostics(&stderr_text);
+            }
+        }
+        tracing::info!("CUDA prewarm phase=released reason={}", reason);
+    }
+}
+
+impl Drop for RunningSidecar {
+    fn drop(&mut self) {
+        // Child::drop deliberately does not reap or terminate the child. An
+        // error while writing/waiting must therefore still release a loading
+        // CUDA context instead of leaving it resident until app exit.
+        drop(self.stdin.take());
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+        if let Some(stdout_thread) = self.stdout_thread.take() {
+            let _ = stdout_thread.join();
+        }
+        if let Some(stderr_thread) = self.stderr_thread.take() {
+            let _ = stderr_thread.join();
+        }
+    }
+}
+
+fn set_default_child_env(cmd: &mut Command, name: &str, value: &str) {
+    if std::env::var_os(name).is_none() {
+        cmd.env(name, value);
+    }
+}
+
+fn log_sidecar_diagnostics(stderr_text: &str) {
+    for line in stderr_text.lines().filter(|line| {
+        line.starts_with("flov-whisper-cuda timing")
+            || line.starts_with("flov-whisper-cuda memory_inputs")
+    }) {
+        tracing::info!("{}", line);
+    }
+    if !stderr_text.trim().is_empty() {
+        tracing::debug!("sidecar stderr: {}", stderr_text.trim());
     }
 }
 
 fn write_samples_to_stdin<W: Write>(stdin: &mut W, samples: &[f32]) -> Result<()> {
-    const CHUNK_SAMPLES: usize = 4096;
-
-    let mut buf = Vec::with_capacity(CHUNK_SAMPLES * 4);
-    for chunk in samples.chunks(CHUNK_SAMPLES) {
-        buf.clear();
-        for sample in chunk {
-            buf.extend_from_slice(&sample.to_le_bytes());
-        }
+    #[cfg(target_endian = "little")]
+    {
+        // Every supported desktop target is little-endian and the sidecar
+        // protocol is raw f32 LE. Borrow the existing PCM allocation instead
+        // of formatting every sample into a second staging Vec.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                samples.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(samples),
+            )
+        };
         stdin
-            .write_all(&buf)
+            .write_all(bytes)
             .context("failed to write samples to sidecar")?;
+        Ok(())
     }
-    Ok(())
+
+    #[cfg(target_endian = "big")]
+    {
+        const CHUNK_SAMPLES: usize = 4096;
+
+        let mut buf = Vec::with_capacity(CHUNK_SAMPLES * 4);
+        for chunk in samples.chunks(CHUNK_SAMPLES) {
+            buf.clear();
+            for sample in chunk {
+                buf.extend_from_slice(&sample.to_le_bytes());
+            }
+            stdin
+                .write_all(&buf)
+                .context("failed to write samples to sidecar")?;
+        }
+        Ok(())
+    }
 }
 
 fn transcription_timeout(sample_count: usize) -> Duration {
@@ -362,5 +705,26 @@ mod tests {
         let samples = crate::audio::TRANSCRIBE_SAMPLE_RATE as usize * 120;
 
         assert_eq!(transcription_timeout(samples), Duration::from_secs(10 * 60));
+    }
+
+    #[test]
+    fn prewarm_snapshot_requires_exact_backend_model_and_language_match() {
+        let base = SidecarSpec {
+            backend: "cuda".into(),
+            sidecar: PathBuf::from("/opt/flov-whisper-cuda"),
+            model_path: PathBuf::from("/models/base.bin"),
+            language: "ru".into(),
+        };
+        let mut changed_model = base.clone();
+        changed_model.model_path = PathBuf::from("/models/small.bin");
+        let mut changed_language = base.clone();
+        changed_language.language = "en".into();
+        let mut changed_backend = base.clone();
+        changed_backend.backend = "cpu".into();
+
+        assert_eq!(base, base.clone());
+        assert_ne!(base, changed_model);
+        assert_ne!(base, changed_language);
+        assert_ne!(base, changed_backend);
     }
 }

@@ -37,6 +37,7 @@ toml_edit = "0.22"
 
 # Error handling
 anyhow = "1"
+wait-timeout = "0.2"
 
 # HTTP client for OpenRouter API
 ureq = { version = "3", features = ["json"] }
