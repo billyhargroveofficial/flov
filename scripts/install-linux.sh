@@ -85,9 +85,29 @@ if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$(dirname "$desktop_file")"
 fi
 
+# Headless systemd user unit. The file is installed but the service is
+# never enabled or started here: it shares [server].bind with the desktop
+# instance, so enabling it must stay an explicit user action.
+service_unit_src="$root/systemd/flov-headless.service"
+user_unit="$HOME/.config/systemd/user/flov-headless.service"
+if [[ -f "$service_unit_src" ]]; then
+    install -Dm644 "$service_unit_src" "$user_unit"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user daemon-reload 2>/dev/null || true
+    fi
+fi
+
 echo "Flov installed:"
 echo "  AppImage: $installed_appimage"
 echo "  launcher: $launcher"
 echo "  desktop:  $desktop_file"
+if [[ -f "$user_unit" ]]; then
+    echo "  service:  $user_unit (unit file only, not enabled)"
+fi
 echo
 echo "Open Rofi drun and select Flov, or run: $launcher"
+if [[ -f "$user_unit" ]]; then
+    echo
+    echo "Headless transcription service (no desktop app, no display):"
+    echo "  systemctl --user enable --now flov-headless.service"
+fi

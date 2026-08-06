@@ -89,6 +89,14 @@ Wayland через `wl-copy` + `wtype`.
 
 HTTP API, LAN bind и bearer token: [docs/API.md](docs/API.md).
 
+Транскрипцию можно держать запущенной без десктопного окна:
+`flov --headless-server` поднимает тот же HTTP API без GTK/трея/микрофона
+и работает вообще без дисплей-сервера (SSH, контейнер, systemd user
+unit). Инсталлятор ставит unit `flov-headless.service`, но не включает
+его — сервис делит порт с десктопным приложением, включение осознанный
+шаг: `systemctl --user enable --now flov-headless.service`. Подробности:
+[docs/LINUX.md](docs/LINUX.md#headless-transcription-service-systemd-user-unit).
+
 ## Settings (правый клик по трею → Open Settings)
 
 - **Models** — каталог Whisper моделей (tiny / base / small / medium / large-v3-turbo)

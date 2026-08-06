@@ -127,7 +127,10 @@ token when `server.api_key` is configured.
 
 The recording routes control the local microphone cycle; they exist
 primarily for Hyprland press/release bindings. Uploaded files only return
-text and never inject it into the focused application.
+text and never inject it into the focused application. In headless mode
+(`--headless-server`) there is no microphone cycle: `/health` always
+reports `"recording": false` and the three recording routes answer
+HTTP 503.
 
 ## OpenAI SDK shape
 
@@ -142,3 +145,28 @@ model:    flov-whisper
 
 Only the audio transcription and model-list subset is implemented; this is
 not a general chat/completions server.
+
+## Headless server mode
+
+`flov --headless-server` (Linux) runs the same server without the desktop
+app — no GTK, tray, hotkeys, microphone, or display server. It is meant
+for a systemd user unit or a plain SSH session; see
+[LINUX.md](LINUX.md#headless-transcription-service-systemd-user-unit) for
+the unit setup.
+
+Differences from the desktop instance:
+
+- `GET /health` and `GET /v1/health` always report `"recording": false`;
+- `GET /v1/recording`, `POST /v1/recording/start`, and
+  `POST /v1/recording/stop` answer HTTP 503 — there is no microphone
+  cycle to control, upload audio to `POST /v1/audio/transcriptions`
+  instead;
+- everything else (transcription endpoint, bearer auth, the LAN
+  `api_key` guard, body/duration limits, postprocess) behaves
+  identically, and `[server]` in `flov.toml` is the same configuration.
+
+The headless server binds `[server].bind` (`127.0.0.1:17432` by default)
+exactly like the desktop app. Running both at once is a port conflict:
+the process that binds second exits non-zero. The control flags
+(`flov --record-start` / `--record-stop`) drive the recording cycle and
+therefore fail against a headless instance.

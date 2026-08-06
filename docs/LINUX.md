@@ -212,3 +212,73 @@ POST http://127.0.0.1:17432/v1/audio/transcriptions
 It can be called independently from the desktop hotkey and does not paste
 the returned text. Full request/response and LAN configuration examples are
 in [API.md](API.md).
+
+## Headless transcription service (systemd user unit)
+
+`flov --headless-server` serves the same OpenAI-compatible API without
+Tauri/GTK, tray, hotkeys, audio capture, or a display server, so it runs
+in an SSH session, on a machine without `DISPLAY`/`WAYLAND_DISPLAY`, or
+under a systemd user unit:
+
+```bash
+flov --headless-server
+```
+
+The flag is handled in `main` before any GTK/Whisper-sidecar audio/hotkey
+initialization. The process stays in the foreground and exits non-zero when
+`[server].enabled` is false, the config is broken, or `[server].bind`
+cannot be bound (for example, the desktop instance already holds the
+port). `GET /health` always reports `"recording": false`, and the
+recording routes (`/v1/recording`, `/v1/recording/start`,
+`/v1/recording/stop`) answer HTTP 503 — there is no microphone cycle to
+control, upload audio to `POST /v1/audio/transcriptions` instead.
+
+### systemd user unit
+
+`scripts/install-linux.sh` installs `systemd/flov-headless.service` into
+`~/.config/systemd/user/` but never enables or starts it: the headless
+service shares `[server].bind` with the desktop app, so enabling it is an
+explicit choice.
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now flov-headless.service
+journalctl --user -u flov-headless -f
+systemctl --user disable --now flov-headless.service
+```
+
+The unit has no `graphical-session.target` dependency and needs no
+`DISPLAY`; `KillMode=control-group` also reaps the Whisper sidecar on
+stop. `ExecStart` runs the installed launcher, so it expects the default
+paths (`~/.local/bin/flov` → `~/.local/share/flov/flov.AppImage`); if you
+use a custom `$XDG_DATA_HOME`, run `systemctl --user edit
+flov-headless` and override `ExecStart=`.
+
+Port conflict: only one process can bind `[server].bind`
+(`127.0.0.1:17432` by default). If the desktop Flov is running, the
+headless service cannot bind; the unit restarts a few times
+(`StartLimitBurst=3` within `StartLimitIntervalSec=30`) and then enters
+the `failed` state instead of retrying forever. Inspect it with
+`systemctl --user status flov-headless` and
+`journalctl --user -u flov-headless -n 50`. Stop the desktop instance
+first, or point one of the two at another port via `[server].bind` in
+`~/.local/share/flov/flov.toml`.
+
+### Unit hardening vs the AppImage runtime
+
+The installed binary is a type-2 AppImage: its runtime mounts the SquashFS
+payload through the setuid helper `/usr/bin/fusermount3`. The unit
+therefore keeps hardening minimal — only `UMask=0077`,
+`KillMode=control-group`, and the restart/start limits. Verified on the
+target machine that not only `NoNewPrivileges=`/`RestrictSUIDSGID=`, but
+also each of `LockPersonality=true`, `RestrictRealtime=true`,
+`SystemCallArchitectures=native`, and
+`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` makes `fusermount3`
+fail the mount before flov starts (`Operation not permitted`, exit 127),
+so none of them are set. `APPIMAGE_EXTRACT_AND_RUN=1` is not recommended
+as a service environment either: it re-extracts roughly 1 GB into `/tmp`
+on every start and leaves `appimage_extracted_*` trees behind on every
+stop. If you need stricter sandboxing, extract the AppImage once
+(`flov.AppImage --appimage-extract`) into a stable AppDir, point
+`ExecStart=` at its `AppRun`, and manage the hardening for that tree
+separately — the extracted tree needs no FUSE mount.

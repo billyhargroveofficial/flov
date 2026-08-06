@@ -1,0 +1,58 @@
+# Flov headless transcription service (systemd USER unit).
+#
+# Serves the same OpenAI-compatible API as the desktop tray app
+# (POST /v1/audio/transcriptions, /v1/models, /health) without GTK,
+# Wayland, tray, hotkeys, or a microphone. The recording endpoints
+# answer HTTP 503 and /health reports "recording": false.
+#
+# Installed by scripts/install-linux.sh into ~/.config/systemd/user/.
+# The installer never enables or starts the unit; do it explicitly:
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now flov-headless.service
+#   journalctl --user -u flov-headless -f
+#
+# Do not run this unit while the desktop Flov instance is running: both
+# bind [server].bind (127.0.0.1:17432 by default), and the loser exits
+# non-zero (under this unit it then restarts until the start limit trips
+# and the unit enters the failed state). Either stop the desktop app or
+# point [server].bind at another port for one of them.
+
+[Unit]
+Description=Flov headless Whisper transcription API
+# Intentionally no graphical-session.target dependency: the service must
+# start and keep running on a machine without DISPLAY/WAYLAND_DISPLAY
+# and must survive logout.
+# A persistent failure (port already bound, broken config) must not loop
+# forever with Restart=on-failure: give up after a few quick attempts so
+# the unit lands in the failed state deterministically on every distro.
+StartLimitIntervalSec=30
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/flov --headless-server
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+UMask=0077
+
+# Hardening is deliberately minimal. The installed binary is a type-2
+# AppImage: its runtime mounts the SquashFS payload through the setuid
+# helper /usr/bin/fusermount3. Verified on the target machine that not
+# only NoNewPrivileges=/RestrictSUIDSGID=, but also each of
+# LockPersonality=true, RestrictRealtime=true,
+# SystemCallArchitectures=native and RestrictAddressFamilies= makes
+# fusermount3 fail the mount before flov starts (Operation not
+# permitted, exit 127), so none of them are set here.
+# APPIMAGE_EXTRACT_AND_RUN=1 is not a runtime alternative either: it
+# re-extracts roughly 1 GB into /tmp on every start and leaves
+# appimage_extracted_* trees behind on every stop.
+# If you need stricter sandboxing, extract the AppImage once
+# (flov.AppImage --appimage-extract) into a stable AppDir, point
+# ExecStart= at its AppRun, and manage the hardening for that tree
+# separately — the extracted tree needs no FUSE mount. Until then the
+# unit keeps only the basics above: UMask, KillMode, restart limits.
+
+[Install]
+WantedBy=default.target
