@@ -30,11 +30,17 @@ const MIN_AUDIO_SAMPLES: usize = 1_600;
 
 #[derive(Clone)]
 pub struct ApiRuntime {
-    pub app: tauri::AppHandle,
+    /// Desktop event sink for the Settings/Stats UI. `None` in headless
+    /// mode, where no Tauri app exists and emitting would have no target.
+    pub app: Option<tauri::AppHandle>,
     pub transcriber: Arc<transcribe::Transcriber>,
     pub post_processor: Arc<Mutex<Option<Arc<postprocess::PostProcessor>>>>,
     pub stats: Arc<stats::Stats>,
     pub active_mode: Arc<AtomicU8>,
+    /// Desktop runs the microphone push-to-talk loop behind the recording
+    /// endpoints; headless mode has none, so those endpoints must report
+    /// unavailable instead of pretending to capture audio.
+    pub recording_supported: bool,
 }
 
 #[derive(Debug)]
@@ -115,10 +121,14 @@ impl Drop for InFlightGuard {
 
 /// Bind and spawn the API server. Binding happens synchronously so a bad
 /// address or an occupied port is visible immediately in the application log.
-pub fn spawn(config: ServerConfig, runtime: ApiRuntime) -> Result<()> {
+///
+/// Returns the actually bound address (`127.0.0.1:17432` for the default
+/// config, an ephemeral port when `bind` ends in `:0`), or `None` when the
+/// server is disabled in the config.
+pub fn spawn(config: ServerConfig, runtime: ApiRuntime) -> Result<Option<SocketAddr>> {
     if !config.enabled {
         tracing::info!("HTTP API disabled");
-        return Ok(());
+        return Ok(None);
     }
 
     let bind: SocketAddr = config
@@ -139,11 +149,14 @@ pub fn spawn(config: ServerConfig, runtime: ApiRuntime) -> Result<()> {
 
     let server = Server::http(bind)
         .map_err(|e| anyhow::anyhow!("failed to bind HTTP API on {bind}: {e}"))?;
+    let bound = server
+        .server_addr()
+        .to_ip()
+        .context("HTTP API bound a non-IP address")?;
     let runtime = Arc::new(runtime);
     let in_flight = Arc::new(AtomicUsize::new(0));
     tracing::info!(
-        "HTTP API listening on http://{} (OpenAI endpoint: /v1/audio/transcriptions)",
-        server.server_addr()
+        "HTTP API listening on http://{bound} (OpenAI endpoint: /v1/audio/transcriptions)"
     );
 
     std::thread::Builder::new()
@@ -181,7 +194,7 @@ pub fn spawn(config: ServerConfig, runtime: ApiRuntime) -> Result<()> {
         })
         .context("spawn HTTP API listener")?;
 
-    Ok(())
+    Ok(Some(bound))
 }
 
 fn handle_request(mut request: Request, config: &ServerConfig, runtime: &ApiRuntime) {
@@ -219,12 +232,16 @@ fn route(
     let path = path_only(&url);
 
     if method == Method::Get && matches!(path, "/health" | "/v1/health") {
+        let recording = health_recording(
+            runtime.recording_supported,
+            runtime.active_mode.load(Ordering::SeqCst),
+        );
         return Ok(ApiResponse::json(
             200,
             json!({
                 "status": "ok",
                 "model_loaded": runtime.transcriber.has_model(),
-                "recording": runtime.active_mode.load(Ordering::SeqCst) != hotkey::MODE_IDLE,
+                "recording": recording,
             }),
         ));
     }
@@ -243,14 +260,19 @@ fn route(
                 }]
             }),
         )),
-        (Method::Get, "/v1/recording") => Ok(recording_state(runtime)),
+        (Method::Get, "/v1/recording") => {
+            require_recording(runtime.recording_supported)?;
+            Ok(recording_state(runtime))
+        }
         (Method::Post, "/v1/recording/start") => {
+            require_recording(runtime.recording_supported)?;
             runtime
                 .active_mode
                 .store(hotkey::MODE_TRANSCRIBE, Ordering::SeqCst);
             Ok(recording_state(runtime))
         }
         (Method::Post, "/v1/recording/stop") => {
+            require_recording(runtime.recording_supported)?;
             runtime
                 .active_mode
                 .store(hotkey::MODE_IDLE, Ordering::SeqCst);
@@ -265,6 +287,28 @@ fn route(
             body: Vec::new(),
         }),
         _ => Err(ApiError::new(404, "endpoint not found")),
+    }
+}
+
+/// What `/health` reports for `recording`. Headless mode has no
+/// microphone cycle, so the flag stays false there even if the mode
+/// byte is flipped. Pure function so the semantics are unit-tested
+/// without a `Transcriber`, `Stats`, or a bound port.
+fn health_recording(recording_supported: bool, active_mode: u8) -> bool {
+    recording_supported && active_mode != hotkey::MODE_IDLE
+}
+
+/// Recording endpoints must not pretend to capture audio when the process
+/// has no microphone loop (headless mode). Fail loudly instead. Pure for
+/// the same reason as `health_recording`.
+fn require_recording(recording_supported: bool) -> std::result::Result<(), ApiError> {
+    if recording_supported {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            503,
+            "recording endpoints are unavailable in headless mode; upload audio to POST /v1/audio/transcriptions instead",
+        ))
     }
 }
 
@@ -357,7 +401,10 @@ fn transcribe_upload(
         runtime
             .stats
             .record(raw_text.chars().count() as u64, decoded.duration_seconds);
-        let _ = runtime.app.emit("stats-updated", ());
+        // Headless mode has no AppHandle; stats are still persisted above.
+        if let Some(app) = &runtime.app {
+            let _ = app.emit("stats-updated", ());
+        }
     }
 
     let text = if let Some(processor) = post_processor {
@@ -893,6 +940,39 @@ mod tests {
 
         assert_eq!(query_value(&query, "language").as_deref(), Some("pt-BR"));
         assert_eq!(query_value(&query, "x").as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn recording_routes_are_unavailable_without_microphone_loop() {
+        // Headless mode must not pretend to control a microphone cycle.
+        let error = require_recording(false).expect_err("headless must refuse recording");
+        assert_eq!(error.status, 503);
+        assert!(error.message.contains("/v1/audio/transcriptions"));
+
+        require_recording(true).expect("desktop supports the recording cycle");
+    }
+
+    #[test]
+    fn health_reports_recording_false_in_headless_mode() {
+        // The mode byte can flip (a desktop /v1/recording/start stores
+        // MODE_TRANSCRIBE), but headless health must stay false.
+        assert!(!health_recording(false, hotkey::MODE_TRANSCRIBE));
+        assert!(!health_recording(false, hotkey::MODE_IDLE));
+
+        assert!(!health_recording(true, hotkey::MODE_IDLE));
+        assert!(health_recording(true, hotkey::MODE_TRANSCRIBE));
+    }
+
+    #[test]
+    fn error_bodies_keep_openai_error_shape() {
+        let server_error: serde_json::Value =
+            serde_json::from_slice(&error_response(ApiError::new(503, "busy")).body).unwrap();
+        assert_eq!(server_error["error"]["type"], "server_error");
+        assert_eq!(server_error["error"]["message"], "busy");
+
+        let client_error: serde_json::Value =
+            serde_json::from_slice(&error_response(ApiError::new(401, "denied")).body).unwrap();
+        assert_eq!(client_error["error"]["type"], "invalid_request_error");
     }
 
     fn test_wav(sample_rate: u32, sample_count: usize) -> Vec<u8> {

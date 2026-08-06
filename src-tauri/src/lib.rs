@@ -3,6 +3,7 @@ pub mod api;
 pub mod audio;
 pub mod config;
 pub mod control;
+pub mod headless;
 pub mod hotkey;
 pub mod input;
 pub mod models;
@@ -254,11 +255,12 @@ pub fn run() {
             if let Err(e) = api::spawn(
                 server_config.clone(),
                 api::ApiRuntime {
-                    app: app_handle.clone(),
+                    app: Some(app_handle.clone()),
                     transcriber: transcriber.clone(),
                     post_processor: post_processor.clone(),
                     stats: stats_for_loop.clone(),
                     active_mode: active_mode.clone(),
+                    recording_supported: true,
                 },
             ) {
                 tracing::error!("HTTP API did not start: {:#}", e);
