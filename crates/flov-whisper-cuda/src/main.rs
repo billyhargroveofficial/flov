@@ -106,16 +106,21 @@ fn run() -> Result<()> {
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     log_phase("stdin_decode", stdin_decode_start.elapsed());
+    let long_form = samples.len() > LONG_FORM_THRESHOLD_SAMPLES;
     let audio_ctx = requested_audio_context(samples.len())?;
     eprintln!(
-        "flov-whisper-cuda memory_inputs model_bytes={model_bytes} stdin_bytes={} decoded_samples={} decoded_bytes={} audio_ms={} flash_attn={flash_attn} threads={threads} audio_ctx={audio_ctx:?} ptt_prewarm={ptt_prewarm} warmup={warmup_enabled}",
+        "flov-whisper-cuda memory_inputs model_bytes={model_bytes} stdin_bytes={} decoded_samples={} decoded_bytes={} audio_ms={} flash_attn={flash_attn} threads={threads} audio_ctx={audio_ctx:?} ptt_prewarm={ptt_prewarm} warmup={warmup_enabled} long_form={long_form}",
         buf.len(),
         samples.len(),
         samples.len() * std::mem::size_of::<f32>(),
         samples.len() as u64 * 1_000 / 16_000,
     );
 
-    let params = full_params(&args.language, threads, audio_ctx);
+    let params = if long_form {
+        long_form_params(&args.language, threads)
+    } else {
+        full_params(&args.language, threads, audio_ctx)
+    };
 
     let full_start = Instant::now();
     state
@@ -149,6 +154,41 @@ fn run() -> Result<()> {
 /// other platforms can opt in after their own regression run.
 fn cuda_flash_attention_enabled() -> bool {
     env_flag("FLOV_CUDA_FLASH_ATTN", cfg!(target_os = "linux"))
+}
+
+// Whisper decodes audio in 30-second windows. The PTT-tuned params below
+// (single_segment + no_timestamps + greedy) silently drop words at every
+// window boundary once the input is longer than one window, which HTTP
+// voice messages routinely are.
+const LONG_FORM_THRESHOLD_SAMPLES: usize = 16_000 * 30;
+
+// Reference long-form decode for inputs over one whisper window: timestamp
+// tokens let whisper.cpp seek to the last complete segment instead of hopping
+// fixed 30-second strides, and beam search recovers boundary words that
+// greedy decoding loses. Latency-insensitive: only the HTTP path feeds audio
+// this long. FLOV_WHISPER_AUDIO_CTX is intentionally not applied — a shrunk
+// encoder context is a PTT latency trick and corrupts multi-window decoding.
+fn long_form_params<'a>(language: &'a str, threads: i32) -> FullParams<'a, 'static> {
+    let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+        beam_size: 5,
+        patience: -1.0,
+    });
+    params.set_n_threads(threads);
+    params.set_translate(false);
+    params.set_no_context(false);
+    params.set_single_segment(false);
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_no_timestamps(false);
+    params.set_temperature_inc(if env_flag("FLOV_WHISPER_TEMPERATURE_FALLBACK", true) {
+        0.2
+    } else {
+        0.0
+    });
+    params.set_language(Some(language));
+    params
 }
 
 fn full_params<'a>(

@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
+const LONG_FORM_THRESHOLD_SAMPLES: usize = 16_000 * 30;
+
 struct Args {
     model: PathBuf,
     language: String,
@@ -73,11 +75,24 @@ fn run() -> Result<()> {
         .collect();
 
     let mut state = ctx.create_state().context("failed to create state")?;
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    // Whisper decodes audio in 30-second windows. The PTT-tuned fast path
+    // (single_segment + no timestamps + greedy) drops words at every window
+    // boundary on longer inputs, so audio over one window switches to the
+    // reference long-form decode: timestamp tokens drive the window seek and
+    // beam search recovers boundary words that greedy decoding loses.
+    let long_form = samples.len() > LONG_FORM_THRESHOLD_SAMPLES;
+    let mut params = if long_form {
+        FullParams::new(SamplingStrategy::BeamSearch {
+            beam_size: 5,
+            patience: -1.0,
+        })
+    } else {
+        FullParams::new(SamplingStrategy::Greedy { best_of: 1 })
+    };
     params.set_n_threads(num_cpus::get() as i32);
     params.set_translate(false);
-    params.set_no_context(true);
-    params.set_single_segment(true);
+    params.set_no_context(!long_form);
+    params.set_single_segment(!long_form);
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
