@@ -63,8 +63,17 @@ function Stage-Sidecar($name) {
 }
 
 function Stage-CudaDlls {
-    $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\x64"
-    if (-not (Test-Path $cudaBin)) {
+    # Same version-independent lookup as build-sidecars.ps1.
+    $cudaBin = $null
+    if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin\x64'))) {
+        $cudaBin = Join-Path $env:CUDA_PATH 'bin\x64'
+    } else {
+        $root = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA'
+        $newest = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1
+        if ($newest) { $cudaBin = Join-Path $newest.FullName 'bin\x64' }
+    }
+    if (-not $cudaBin -or -not (Test-Path $cudaBin)) {
         Write-Warning "CUDA bin dir not found at $cudaBin — cublas DLLs not staged"
         return
     }

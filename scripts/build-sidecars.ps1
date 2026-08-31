@@ -41,7 +41,25 @@ $env:CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING = "1"
 
 # Source for runtime DLLs that CUDA / Vulkan / etc. dynamically load.
 # Adjust if CUDA installs elsewhere.
-$cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\x64"
+# CUDA's install path carries its version, so a hard-coded one silently
+# breaks on every toolkit upgrade: the build still succeeds and the
+# installer just ships without cuBLAS, leaving the CUDA sidecar unable to
+# start on the user's machine. Prefer CUDA_PATH, then the newest toolkit.
+function Resolve-CudaBinDir {
+    if ($env:CUDA_PATH) {
+        $fromEnv = Join-Path $env:CUDA_PATH 'bin\x64'
+        if (Test-Path $fromEnv) { return $fromEnv }
+    }
+    $root = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA'
+    if (Test-Path $root) {
+        $newest = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1
+        if ($newest) { return (Join-Path $newest.FullName 'bin\x64') }
+    }
+    return $null
+}
+
+$cudaBin = Resolve-CudaBinDir
 $cudaDlls = @("cublas64_13.dll", "cublasLt64_13.dll")
 
 function Build-One($name) {
@@ -72,7 +90,7 @@ function Build-One($name) {
 }
 
 function Stage-CudaDlls {
-    if (-not (Test-Path $cudaBin)) {
+    if (-not $cudaBin -or -not (Test-Path $cudaBin)) {
         Write-Warning "CUDA bin dir not found at $cudaBin — cublas DLLs not staged"
         return
     }
