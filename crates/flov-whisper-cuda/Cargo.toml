@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 whisper-rs = { version = "0.16", features = ["cuda"] }
+flov-tuning = { path = "../flov-tuning" }
 anyhow = "1"
 num_cpus = "1"
 

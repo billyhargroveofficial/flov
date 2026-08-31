@@ -138,3 +138,43 @@ Add `coreml` to features. CoreML expects `<model>.mlmodelc` next to the
 The whisper.cpp repo has scripts to generate these from a Whisper model.
 First inference with CoreML compiles the model (slow, one-off), then ANE
 takes over.
+
+## Decoding tuning (`flov-tuning`)
+
+Every sidecar links `crates/flov-tuning`, a small shared library so the four
+backends cannot drift apart. All of it is opt-in through environment
+variables: unset, a sidecar decodes exactly as it did before.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `FLOV_WHISPER_VAD_MODEL` | unset | Path to a Silero ggml model (`ggml-silero-v5.1.2.bin`). Enables the VAD prefilter. |
+| `FLOV_WHISPER_VAD_THRESHOLD` | `0.5` | Speech probability threshold. Lower keeps laughter and interjections. |
+| `FLOV_WHISPER_VAD_SPEECH_PAD_MS` | `30` | Padding around each speech segment. |
+| `FLOV_WHISPER_VAD_MIN_SPEECH_MS` | `250` | Shorter bursts are discarded. |
+| `FLOV_WHISPER_VAD_MIN_SILENCE_MS` | `100` | Silence needed to split segments. |
+| `FLOV_WHISPER_VAD_SAMPLES_OVERLAP` | `0.1` | Seconds of overlap carried into the next segment. |
+| `FLOV_WHISPER_VAD_GPU` | `0` | Run VAD on the GPU. |
+| `FLOV_WHISPER_PROMPT` | unset | Whisper's initial prompt. Biases domain spelling. |
+| `FLOV_WHISPER_QUALITY` | `0` | Force the beam-search long-form decode on sub-window clips too. |
+| `FLOV_WHISPER_SUPPRESS_NST` | `0` | Suppress non-speech tokens. |
+| `FLOV_WHISPER_NO_SPEECH_THOLD` / `_ENTROPY_THOLD` / `_LOGPROB_THOLD` | whisper.cpp defaults | Decoder fallback thresholds. |
+
+### Why VAD runs here and not in whisper.cpp
+
+whisper.cpp applies `whisper_full_params.vad` inside `whisper_full()`. The
+sidecars decode through `whisper_full_with_state()`, which skips that stage
+entirely — setting `params.vad` there is silently ignored. `flov-tuning`
+therefore runs Silero itself and feeds the decoder only the speech, mirroring
+upstream's segment stitching (overlap on every segment but the last, 100 ms of
+silence between them).
+
+This matters because a clip with no speech does not produce an empty
+transcript: whisper fills the silence with subtitle credits from its training
+data ("Субтитры сделал DimaTorzok", "Продолжение следует..."). With the VAD
+prefilter the sidecar prints nothing and the caller decides what to do.
+
+### A note on `FLOV_WHISPER_QUALITY`
+
+Beam search is not free accuracy. On a 3.7 s noisy clip it produced a
+hallucinated subtitle credit where the greedy fast path transcribed correctly,
+so the flag stays off by default. Measure on your own corpus before enabling.

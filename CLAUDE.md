@@ -58,6 +58,7 @@ flov/
 │       └── stats.rs       # JSON-лог записей по дням (для heatmap)
 ├── crates/             # sidecar transcription backends (см. crates/README.md)
 │   ├── README.md       # архитектура sidecars + Mac/Metal гайд (исторический)
+│   ├── flov-tuning/          # общий VAD-префильтр + env-ручки декодера для всех sidecar'ов
 │   ├── flov-whisper-cuda/    # NVIDIA, whisper-rs feature cuda
 │   ├── flov-whisper-vulkan/  # AMD/Intel iGPU, whisper-rs feature vulkan
 │   ├── flov-whisper-cpu/     # fallback

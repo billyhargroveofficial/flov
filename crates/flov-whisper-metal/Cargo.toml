@@ -16,6 +16,7 @@ path = "src/main.rs"
 # `coreml` later if/when we ship the .mlmodelc encoder alongside the
 # .bin model — that runs the encoder on the Apple Neural Engine.
 whisper-rs = { version = "0.16", features = ["metal"] }
+flov-tuning = { path = "../flov-tuning" }
 anyhow = "1"
 num_cpus = "1"
 

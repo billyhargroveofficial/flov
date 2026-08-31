@@ -1,0 +1,13 @@
+[package]
+name = "flov-tuning"
+version = "0.1.0"
+edition = "2021"
+description = "Shared decoding tuning and VAD prefilter for the flov whisper sidecars"
+
+# Standalone workspace, like every sidecar crate: each backend build graph
+# resolves whisper-rs with its own accelerator feature.
+[workspace]
+
+[dependencies]
+whisper-rs = "0.16"
+anyhow = "1"

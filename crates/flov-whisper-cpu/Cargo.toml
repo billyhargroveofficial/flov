@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 # whisper-rs without `cuda` / `vulkan` / `metal` features = CPU build.
 whisper-rs = "0.16"
+flov-tuning = { path = "../flov-tuning" }
 anyhow = "1"
 num_cpus = "1"
 

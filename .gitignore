@@ -1,4 +1,6 @@
 /target
+# Sidecar crates are standalone workspaces with their own target dirs
+crates/*/target/
 *.log
 *.zip
 *.bin

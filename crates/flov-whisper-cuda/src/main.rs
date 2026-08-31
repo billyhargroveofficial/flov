@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use flov_tuning::{apply_decoding_tuning, env_flag, quality_mode, vad_filter_samples};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 struct Args {
@@ -106,6 +107,14 @@ fn run() -> Result<()> {
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     log_phase("stdin_decode", stdin_decode_start.elapsed());
+    let samples = vad_filter_samples(samples, threads)?;
+    // An input whose speech VAD rejected entirely has nothing to decode, and
+    // decoding it anyway is exactly how hallucinated text appears.
+    if samples.is_empty() {
+        eprintln!("flov-whisper-cuda vad_result=no_speech");
+        log_phase("total", total_start.elapsed());
+        return Ok(());
+    }
     let long_form = samples.len() > LONG_FORM_THRESHOLD_SAMPLES;
     let audio_ctx = requested_audio_context(samples.len())?;
     eprintln!(
@@ -116,11 +125,16 @@ fn run() -> Result<()> {
         samples.len() as u64 * 1_000 / 16_000,
     );
 
-    let params = if long_form {
+    // Quality mode trades PTT latency for accuracy: it forces the beam-search
+    // long-form decode on every input, including the sub-window clips that the
+    // hotkey path deliberately decodes greedily. The HTTP server sets it; the
+    // desktop hotkey leaves it off.
+    let mut params = if long_form || quality_mode() {
         long_form_params(&args.language, threads)
     } else {
         full_params(&args.language, threads, audio_ctx)
     };
+    apply_decoding_tuning(&mut params);
 
     let full_start = Instant::now();
     state
@@ -252,14 +266,6 @@ fn requested_audio_context(sample_count: usize) -> Result<Option<i32>> {
 fn auto_audio_context(sample_count: usize) -> i32 {
     let needed = sample_count.div_ceil(320).saturating_add(128);
     needed.div_ceil(128).saturating_mul(128).clamp(256, 1500) as i32
-}
-
-fn env_flag(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) if matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO") => false,
-        Ok(value) if matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES") => true,
-        Ok(_) | Err(_) => default,
-    }
 }
 
 fn log_phase(phase: &str, elapsed: Duration) {
