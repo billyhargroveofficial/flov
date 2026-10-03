@@ -14,11 +14,13 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 struct Args {
     model: PathBuf,
     language: String,
+    segments_json: bool,
 }
 
 fn parse_args() -> Result<Args> {
     let mut model: Option<PathBuf> = None;
     let mut language = String::from("ru");
+    let mut segments_json = false;
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
         match a.as_str() {
@@ -30,6 +32,7 @@ fn parse_args() -> Result<Args> {
             "--language" => {
                 language = iter.next().context("--language requires a value")?;
             }
+            "--segments-json" => segments_json = true,
             other => bail!("unknown argument: {}", other),
         }
     }
@@ -37,7 +40,11 @@ fn parse_args() -> Result<Args> {
     if !model.exists() {
         bail!("model file not found: {}", model.display());
     }
-    Ok(Args { model, language })
+    Ok(Args {
+        model,
+        language,
+        segments_json,
+    })
 }
 
 fn main() {
@@ -107,6 +114,13 @@ fn run() -> Result<()> {
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     log_phase("stdin_decode", stdin_decode_start.elapsed());
+    if args.segments_json {
+        let json =
+            flov_tuning::transcribe_timed_json(&mut state, &samples, &args.language, threads)?;
+        std::io::stdout().lock().write_all(json.as_bytes())?;
+        log_phase("total", total_start.elapsed());
+        return Ok(());
+    }
     let samples = vad_filter_samples(samples, threads)?;
     // An input whose speech VAD rejected entirely has nothing to decode, and
     // decoding it anyway is exactly how hallucinated text appears.

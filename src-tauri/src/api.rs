@@ -281,6 +281,9 @@ fn route(
         (Method::Post, "/v1/audio/transcriptions") => {
             transcribe_upload(request, &url, config, runtime)
         }
+        (Method::Post, "/v1/audio/transcriptions/timed") => {
+            transcribe_timed_upload(request, &url, config, runtime)
+        }
         (Method::Options, _) => Ok(ApiResponse {
             status: 204,
             content_type: "text/plain; charset=utf-8",
@@ -432,6 +435,51 @@ fn transcribe_upload(
         "json" | "" => Ok(ApiResponse::json(200, json!({ "text": text }))),
         _ => unreachable!("response_format validated before transcription"),
     }
+}
+
+/// Editing-oriented JSON endpoint. Timestamps refer to the input audio, even
+/// when VAD removes silent intervals before Whisper runs.
+fn transcribe_timed_upload(
+    request: &mut Request,
+    url: &str,
+    config: &ServerConfig,
+    runtime: &ApiRuntime,
+) -> std::result::Result<ApiResponse, ApiError> {
+    if !runtime.transcriber.has_model() {
+        return Err(ApiError::new(503, "Whisper model is not configured"));
+    }
+    let upload = read_upload(request, url, config.max_body_mb)?;
+    if upload.postprocess == Some(true) {
+        return Err(ApiError::bad_request(
+            "postprocess=true cannot preserve segment/text alignment",
+        ));
+    }
+    let language = validate_language(upload.language.as_deref())?;
+    let decoded = decode_audio(
+        &upload.audio,
+        upload.filename.as_deref(),
+        upload.content_type.as_deref(),
+        config.max_audio_seconds,
+    )
+    .map_err(|e| ApiError::bad_request(format!("audio decode failed: {e:#}")))?;
+    let raw = runtime
+        .transcriber
+        .transcribe_timed_with_language(&decoded.samples, language.as_deref())
+        .map_err(|e| ApiError::internal(format!("timed transcription failed: {e:#}")))?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| ApiError::internal(format!("invalid timed sidecar JSON: {e}")))?;
+    let chars = value["text"].as_str().unwrap_or("").chars().count();
+    if chars > 0 {
+        runtime.stats.record(chars as u64, decoded.duration_seconds);
+        if let Some(app) = &runtime.app {
+            let _ = app.emit("stats-updated", ());
+        }
+    }
+    value["task"] = json!("transcribe");
+    value["language"] = json!(language
+        .as_deref()
+        .unwrap_or_else(|| runtime.transcriber.default_language()));
+    Ok(ApiResponse::json(200, value))
 }
 
 fn read_upload(

@@ -41,6 +41,27 @@ Supported `response_format` values:
   empty `segments` array;
 - `text`: UTF-8 `text/plain`.
 
+For video editing, use the separate timestamped JSON endpoint. It returns
+Whisper's phrase-level segments on the **original audio clock** (seconds),
+even when the configured VAD skips silence:
+
+```bash
+curl -sS http://127.0.0.1:17432/v1/audio/transcriptions/timed \
+  -F model=flov-whisper \
+  -F language=ru \
+  -F file=@speech.wav
+```
+
+```json
+{"task":"transcribe","language":"ru","duration":6.5,"text":"Пример речи.","segments":[{"id":0,"start":0.42,"end":2.8,"text":"Пример речи."}]}
+```
+
+This route always returns JSON. The segment times are Whisper estimates and
+should be reviewed around cuts; it does not provide word-level alignment.
+`postprocess=true` is rejected because rewriting text would break its
+relationship to the segments. The original endpoint and dictation output are
+unchanged.
+
 The optional Flov extension `postprocess=true` sends the transcript through
 the OpenRouter cleanup configured in Settings:
 

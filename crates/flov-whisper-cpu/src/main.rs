@@ -19,11 +19,13 @@ const LONG_FORM_THRESHOLD_SAMPLES: usize = 16_000 * 30;
 struct Args {
     model: PathBuf,
     language: String,
+    segments_json: bool,
 }
 
 fn parse_args() -> Result<Args> {
     let mut model: Option<PathBuf> = None;
     let mut language = String::from("ru");
+    let mut segments_json = false;
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
         match a.as_str() {
@@ -35,6 +37,7 @@ fn parse_args() -> Result<Args> {
             "--language" => {
                 language = iter.next().context("--language requires a value")?;
             }
+            "--segments-json" => segments_json = true,
             other => bail!("unknown argument: {}", other),
         }
     }
@@ -42,7 +45,11 @@ fn parse_args() -> Result<Args> {
     if !model.exists() {
         bail!("model file not found: {}", model.display());
     }
-    Ok(Args { model, language })
+    Ok(Args {
+        model,
+        language,
+        segments_json,
+    })
 }
 
 fn main() {
@@ -76,6 +83,13 @@ fn run() -> Result<()> {
         .collect();
 
     let threads = num_cpus::get() as i32;
+    if args.segments_json {
+        let mut state = ctx.create_state().context("failed to create state")?;
+        let json =
+            flov_tuning::transcribe_timed_json(&mut state, &samples, &args.language, threads)?;
+        std::io::stdout().lock().write_all(json.as_bytes())?;
+        return Ok(());
+    }
     let samples = vad_filter_samples(samples, threads)?;
     // An input whose speech VAD rejected entirely has nothing to decode, and
     // decoding it anyway is exactly how hallucinated text appears.

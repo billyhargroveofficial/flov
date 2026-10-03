@@ -11,3 +11,4 @@ description = "Shared decoding tuning and VAD prefilter for the flov whisper sid
 [dependencies]
 whisper-rs = "0.16"
 anyhow = "1"
+serde_json = "1"

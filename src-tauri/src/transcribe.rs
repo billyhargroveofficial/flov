@@ -197,7 +197,7 @@ impl Transcriber {
             spec.language,
             spec.sidecar
         );
-        let running = RunningSidecar::spawn(&spec, true, true)?;
+        let running = RunningSidecar::spawn(&spec, true, true, false)?;
         let prepared = PreparedSidecar {
             spec,
             running,
@@ -262,7 +262,7 @@ impl Transcriber {
                                 "prepared sidecar exhausted the transcription deadline"
                             ))
                         } else {
-                            RunningSidecar::spawn(&spec, true, false)
+                            RunningSidecar::spawn(&spec, true, false, false)
                                 .and_then(|running| running.finish(samples, retry_timeout))
                         };
                         match retry {
@@ -303,7 +303,7 @@ impl Transcriber {
             spec.model_path,
             spec.language
         );
-        let text = RunningSidecar::spawn(&spec, true, false)?
+        let text = RunningSidecar::spawn(&spec, true, false, false)?
             .finish(samples, transcription_timeout(samples.len()))?;
         tracing::info!(
             "transcribe phase=fresh-complete total={:?} chars={}",
@@ -336,7 +336,7 @@ impl Transcriber {
             spec.sidecar,
             spec.language
         );
-        let text = RunningSidecar::spawn(&spec, false, false)?
+        let text = RunningSidecar::spawn(&spec, false, false, false)?
             .finish(samples, transcription_timeout(samples.len()))?;
         tracing::info!(
             "transcribe phase=http-or-explicit-language-complete total={:?} chars={}",
@@ -344,6 +344,20 @@ impl Transcriber {
             text.chars().count()
         );
         Ok(text)
+    }
+
+    /// Segment timestamps are measured on the uploaded audio clock. The
+    /// sidecar only switches its output protocol for this explicit request.
+    pub fn transcribe_timed_with_language(
+        &self,
+        samples: &[f32],
+        language: Option<&str>,
+    ) -> Result<String> {
+        let _inference_guard = self.inference_lock.lock().unwrap();
+        self.discard_prepared("superseded by timed HTTP request");
+        let spec = self.current_spec(language.unwrap_or(&self.language))?;
+        RunningSidecar::spawn(&spec, false, false, true)?
+            .finish(samples, transcription_timeout(samples.len()))
     }
 
     fn current_spec(&self, language: &str) -> Result<SidecarSpec> {
@@ -374,7 +388,12 @@ impl Drop for Transcriber {
 }
 
 impl RunningSidecar {
-    fn spawn(spec: &SidecarSpec, ptt_request: bool, ptt_prewarm: bool) -> Result<Self> {
+    fn spawn(
+        spec: &SidecarSpec,
+        ptt_request: bool,
+        ptt_prewarm: bool,
+        segments_json: bool,
+    ) -> Result<Self> {
         let mut cmd = Command::new(&spec.sidecar);
         cmd.arg("--model")
             .arg(&spec.model_path)
@@ -383,6 +402,9 @@ impl RunningSidecar {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if segments_json {
+            cmd.arg("--segments-json");
+        }
         if cfg!(target_os = "linux") && ptt_request && spec.backend == "cuda" {
             // These defaults are tuned for low-latency local dictation on the
             // current Ryzen 5950X / RTX 3080 Ti. Explicit user environment

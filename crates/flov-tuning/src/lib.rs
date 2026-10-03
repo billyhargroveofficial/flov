@@ -6,9 +6,11 @@
 //! headless HTTP service turns the quality knobs on.
 
 use anyhow::{anyhow, Result};
+use serde_json::json;
 use std::time::Instant;
 use whisper_rs::{
-    FullParams, WhisperVadContext, WhisperVadContextParams, WhisperVadParams,
+    FullParams, SamplingStrategy, WhisperState, WhisperVadContext, WhisperVadContextParams,
+    WhisperVadParams,
 };
 
 pub const WHISPER_SAMPLE_RATE: usize = 16_000;
@@ -119,6 +121,124 @@ pub fn vad_filter_samples(samples: Vec<f32>, threads: i32) -> Result<Vec<f32>> {
         started.elapsed().as_secs_f64() * 1_000.0,
     );
     Ok(filtered)
+}
+
+/// Transcribe speech ranges separately so timestamps still refer to the
+/// original, uncompressed recording. The ordinary text/keyboard path keeps
+/// its existing VAD compaction and output protocol.
+pub fn transcribe_timed_json(
+    state: &mut WhisperState,
+    samples: &[f32],
+    language: &str,
+    threads: i32,
+) -> Result<String> {
+    let mut segments = Vec::new();
+    let mut full_text = String::new();
+    let duration = samples.len() as f64 / WHISPER_SAMPLE_RATE as f64;
+
+    for (range_start, range_end) in vad_speech_ranges(samples, threads)? {
+        if range_end.saturating_sub(range_start) < WHISPER_SAMPLE_RATE / 10 {
+            continue;
+        }
+        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+            beam_size: 5,
+            patience: -1.0,
+        });
+        params.set_n_threads(threads);
+        params.set_translate(false);
+        params.set_no_context(true);
+        params.set_single_segment(false);
+        params.set_no_timestamps(false);
+        params.set_print_special(false);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        params.set_language(Some(language));
+        apply_decoding_tuning(&mut params);
+        state.full(params, &samples[range_start..range_end])?;
+
+        let offset = range_start as f64 / WHISPER_SAMPLE_RATE as f64;
+        let range_duration = (range_end - range_start) as f64 / WHISPER_SAMPLE_RATE as f64;
+        for index in 0..state.full_n_segments() {
+            let Some(segment) = state.get_segment(index) else {
+                continue;
+            };
+            let raw = segment.to_str_lossy()?;
+            let text = raw.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let start =
+                offset + (segment.start_timestamp() as f64 / 100.0).clamp(0.0, range_duration);
+            let end = offset + (segment.end_timestamp() as f64 / 100.0).clamp(0.0, range_duration);
+            if end <= start {
+                continue;
+            }
+            full_text.push_str(&raw);
+            segments.push(json!({
+                "id": segments.len(),
+                "start": start,
+                "end": end,
+                "text": text,
+            }));
+        }
+    }
+
+    Ok(json!({
+        "duration": duration,
+        "text": full_text.trim(),
+        "segments": segments,
+    })
+    .to_string())
+}
+
+/// VAD spans on the source clock. Merge padded/overlapping spans to avoid
+/// transcribing a boundary twice; keep silent gaps out of the decoder.
+fn vad_speech_ranges(samples: &[f32], threads: i32) -> Result<Vec<(usize, usize)>> {
+    let Some(model_path) = env_text("FLOV_WHISPER_VAD_MODEL") else {
+        return Ok(vec![(0, samples.len())]);
+    };
+    let mut context_params = WhisperVadContextParams::new();
+    context_params.set_n_threads(threads);
+    context_params.set_use_gpu(env_flag("FLOV_WHISPER_VAD_GPU", false));
+    let mut vad = WhisperVadContext::new(&model_path, context_params)
+        .map_err(|err| anyhow!("failed to load VAD model {model_path}: {err}"))?;
+    let mut vad_params = WhisperVadParams::new();
+    vad_params.set_samples_overlap(env_f32("FLOV_WHISPER_VAD_SAMPLES_OVERLAP").unwrap_or(0.1));
+    if let Some(value) = env_f32("FLOV_WHISPER_VAD_THRESHOLD") {
+        vad_params.set_threshold(value);
+    }
+    if let Some(value) = env_f32("FLOV_WHISPER_VAD_SPEECH_PAD_MS") {
+        vad_params.set_speech_pad(value as i32);
+    }
+    if let Some(value) = env_f32("FLOV_WHISPER_VAD_MIN_SPEECH_MS") {
+        vad_params.set_min_speech_duration(value as i32);
+    }
+    if let Some(value) = env_f32("FLOV_WHISPER_VAD_MIN_SILENCE_MS") {
+        vad_params.set_min_silence_duration(value as i32);
+    }
+    let detected = vad
+        .segments_from_samples(vad_params, samples)
+        .map_err(|err| anyhow!("VAD segmentation failed: {err}"))?;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for index in 0..detected.num_segments() {
+        let Some(segment) = detected.get_segment(index) else {
+            continue;
+        };
+        let start = cs_to_samples(segment.start).min(samples.len());
+        let end = cs_to_samples(segment.end).min(samples.len());
+        if end <= start {
+            continue;
+        }
+        if let Some(last) = ranges.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        ranges.push((start, end));
+    }
+    Ok(ranges)
 }
 
 /// VAD segment timestamps are centiseconds, matching `samples_to_cs` in whisper.cpp.
