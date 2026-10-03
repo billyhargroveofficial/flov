@@ -42,8 +42,8 @@ Supported `response_format` values:
 - `text`: UTF-8 `text/plain`.
 
 For video editing, use the separate timestamped JSON endpoint. It returns
-Whisper's phrase-level segments on the **original audio clock** (seconds),
-even when the configured VAD skips silence:
+Whisper's phrase-level segments and estimated word times on the **original
+audio clock** (seconds), even when the configured VAD skips silence:
 
 ```bash
 curl -sS http://127.0.0.1:17432/v1/audio/transcriptions/timed \
@@ -53,11 +53,14 @@ curl -sS http://127.0.0.1:17432/v1/audio/transcriptions/timed \
 ```
 
 ```json
-{"task":"transcribe","language":"ru","duration":6.5,"text":"Пример речи.","segments":[{"id":0,"start":0.42,"end":2.8,"text":"Пример речи."}]}
+{"task":"transcribe","language":"ru","duration":6.5,"text":"Пример речи.","segments":[{"id":0,"start":0.42,"end":2.8,"text":"Пример речи.","words":[{"start":0.42,"end":1.24,"text":"Пример"},{"start":1.26,"end":2.8,"text":"речи."}]}]}
 ```
 
-This route always returns JSON. The segment times are Whisper estimates and
-should be reviewed around cuts; it does not provide word-level alignment.
+This route always returns JSON. Phrase and word times are Whisper estimates;
+review them around cuts and for subtitle synchronization. Word text is assembled
+from raw token bytes before UTF-8 decoding, since a token can end in the middle
+of a multibyte character. The original transcription endpoint and dictation
+output are unchanged.
 `postprocess=true` is rejected because rewriting text would break its
 relationship to the segments. The original endpoint and dictation output are
 unchanged.

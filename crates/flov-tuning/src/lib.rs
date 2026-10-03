@@ -149,6 +149,7 @@ pub fn transcribe_timed_json(
         params.set_no_context(true);
         params.set_single_segment(false);
         params.set_no_timestamps(false);
+        params.set_token_timestamps(true);
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
@@ -163,23 +164,77 @@ pub fn transcribe_timed_json(
             let Some(segment) = state.get_segment(index) else {
                 continue;
             };
-            let raw = segment.to_str_lossy()?;
-            let text = raw.trim();
-            if text.is_empty() {
-                continue;
-            }
             let start =
                 offset + (segment.start_timestamp() as f64 / 100.0).clamp(0.0, range_duration);
             let end = offset + (segment.end_timestamp() as f64 / 100.0).clamp(0.0, range_duration);
             if end <= start {
                 continue;
             }
-            full_text.push_str(&raw);
+            // Whisper can split a UTF-8 character across token boundaries.
+            // Decode only after collecting the original bytes; decoding each
+            // token separately turns Cyrillic speech into replacement chars.
+            let mut raw_bytes = Vec::new();
+            let mut words = Vec::new();
+            let mut word_bytes = Vec::new();
+            let mut word_start = 0.0;
+            let mut word_end = 0.0;
+            for token_index in 0..segment.n_tokens() {
+                let Some(token) = segment.get_token(token_index) else {
+                    continue;
+                };
+                let token_bytes = token.to_bytes()?;
+                let token_data = token.token_data();
+                if token_bytes.is_empty()
+                    || token_bytes.starts_with(b"[_")
+                    || token_bytes.starts_with(b"<|")
+                    || token_data.t0 < 0
+                    || token_data.t1 < token_data.t0
+                {
+                    continue;
+                }
+                let token_start =
+                    offset + (token_data.t0 as f64 / 100.0).clamp(0.0, range_duration);
+                let token_end = offset + (token_data.t1 as f64 / 100.0).clamp(0.0, range_duration);
+                for &byte in token_bytes {
+                    raw_bytes.push(byte);
+                    if byte.is_ascii_whitespace() {
+                        if !word_bytes.is_empty() {
+                            words.push(json!({
+                                "start": word_start,
+                                "end": word_end,
+                                "text": String::from_utf8_lossy(&word_bytes),
+                            }));
+                            word_bytes.clear();
+                        }
+                    } else {
+                        if word_bytes.is_empty() {
+                            word_start = token_start;
+                        }
+                        word_end = token_end;
+                        word_bytes.push(byte);
+                    }
+                }
+            }
+            if !word_bytes.is_empty() {
+                words.push(json!({
+                    "start": word_start,
+                    "end": word_end,
+                    "text": String::from_utf8_lossy(&word_bytes),
+                }));
+            }
+            let raw = String::from_utf8_lossy(&raw_bytes);
+            let text = raw.trim();
+            if text.is_empty() {
+                continue;
+            }
+            full_text.push_str(text);
+            full_text.push(' ');
             segments.push(json!({
                 "id": segments.len(),
                 "start": start,
                 "end": end,
                 "text": text,
+                "words": words,
             }));
         }
     }
