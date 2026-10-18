@@ -234,11 +234,11 @@ mod linux_impl {
         // latency and does not make the selection any more ready.
         match Command::new("wtype")
             .arg("-M")
-            .arg("ctrl")
+            .arg("shift")
             .arg("-k")
-            .arg("v")
+            .arg("Insert")
             .arg("-m")
-            .arg("ctrl")
+            .arg("shift")
             .status()
         {
             Ok(status) if status.success() => {}
