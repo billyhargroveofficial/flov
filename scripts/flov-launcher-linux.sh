@@ -17,7 +17,13 @@ if [[ $# -gt 0 ]]; then
     exec "$appimage" "$@"
 fi
 
-if pgrep -x flov_app >/dev/null 2>&1; then
+# A control client (--server-health, --record-*) is the same flov_app binary
+# and stays alive for up to a couple of seconds while flov-mouse-toggle polls
+# the service every ~5s. A plain `pgrep -x flov_app` guard treated that
+# transient process as "already running", exited 0, and Flov silently never
+# started at login (2026-09-16). Only the real app instance runs with an
+# empty command line.
+if pgrep -ax flov_app 2>/dev/null | grep -qv -- ' --'; then
     exit 0
 fi
 

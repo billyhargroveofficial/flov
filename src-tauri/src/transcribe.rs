@@ -12,7 +12,8 @@ use anyhow::{Context, Result};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
@@ -99,6 +100,10 @@ pub struct Transcriber {
     /// A CUDA sidecar started on PTT-down. It owns VRAM only while the
     /// hotkey is held, then gets consumed (or killed) on PTT-up.
     prepared: Mutex<Option<PreparedSidecar>>,
+    /// Background wait for a sidecar that already returned its transcript
+    /// but is still tearing down its GPU context. Joined before the next
+    /// spawn so two contexts never overlap in VRAM.
+    exiting: Mutex<Option<JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,8 +117,8 @@ struct SidecarSpec {
 struct RunningSidecar {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout_thread: Option<std::thread::JoinHandle<std::io::Result<String>>>,
-    stderr_thread: Option<std::thread::JoinHandle<String>>,
+    stdout_rx: Option<mpsc::Receiver<std::io::Result<String>>>,
+    stderr_thread: Option<JoinHandle<String>>,
 }
 
 struct PreparedSidecar {
@@ -138,7 +143,20 @@ impl Transcriber {
             backend_choice,
             inference_lock: Mutex::new(()),
             prepared: Mutex::new(None),
+            exiting: Mutex::new(None),
         })
+    }
+
+    fn spawn_sidecar(
+        &self,
+        spec: &SidecarSpec,
+        ptt_request: bool,
+        ptt_prewarm: bool,
+    ) -> Result<RunningSidecar> {
+        if let Some(exiting) = self.exiting.lock().unwrap().take() {
+            let _ = exiting.join();
+        }
+        RunningSidecar::spawn(spec, ptt_request, ptt_prewarm)
     }
 
     /// Lightweight pre-flight: does the configured model file exist on
@@ -197,7 +215,7 @@ impl Transcriber {
             spec.language,
             spec.sidecar
         );
-        let running = RunningSidecar::spawn(&spec, true, true)?;
+        let running = self.spawn_sidecar(&spec, true, true)?;
         let prepared = PreparedSidecar {
             spec,
             running,
@@ -244,7 +262,7 @@ impl Transcriber {
                 );
                 let timeout = transcription_timeout(samples.len());
                 let attempt_start = Instant::now();
-                let text = match prepared.running.finish(samples, timeout) {
+                let text = match prepared.running.finish(samples, timeout, &self.exiting) {
                     Ok(text) => text,
                     Err(prewarm_error) => {
                         // spawn() only proves that the process was created;
@@ -262,8 +280,9 @@ impl Transcriber {
                                 "prepared sidecar exhausted the transcription deadline"
                             ))
                         } else {
-                            RunningSidecar::spawn(&spec, true, false)
-                                .and_then(|running| running.finish(samples, retry_timeout))
+                            self.spawn_sidecar(&spec, true, false).and_then(|running| {
+                                running.finish(samples, retry_timeout, &self.exiting)
+                            })
                         };
                         match retry {
                             Ok(text) => text,
@@ -303,8 +322,11 @@ impl Transcriber {
             spec.model_path,
             spec.language
         );
-        let text = RunningSidecar::spawn(&spec, true, false)?
-            .finish(samples, transcription_timeout(samples.len()))?;
+        let text = self.spawn_sidecar(&spec, true, false)?.finish(
+            samples,
+            transcription_timeout(samples.len()),
+            &self.exiting,
+        )?;
         tracing::info!(
             "transcribe phase=fresh-complete total={:?} chars={}",
             total_start.elapsed(),
@@ -336,8 +358,11 @@ impl Transcriber {
             spec.sidecar,
             spec.language
         );
-        let text = RunningSidecar::spawn(&spec, false, false)?
-            .finish(samples, transcription_timeout(samples.len()))?;
+        let text = self.spawn_sidecar(&spec, false, false)?.finish(
+            samples,
+            transcription_timeout(samples.len()),
+            &self.exiting,
+        )?;
         tracing::info!(
             "transcribe phase=http-or-explicit-language-complete total={:?} chars={}",
             total_start.elapsed(),
@@ -402,9 +427,10 @@ impl RunningSidecar {
             .with_context(|| format!("failed to spawn sidecar: {:?}", spec.sidecar))?;
 
         let mut stdout = child.stdout.take().context("sidecar stdout missing")?;
-        let stdout_thread = std::thread::spawn(move || {
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        std::thread::spawn(move || {
             let mut buf = String::new();
-            stdout.read_to_string(&mut buf).map(|_| buf)
+            let _ = stdout_tx.send(stdout.read_to_string(&mut buf).map(|_| buf));
         });
 
         let mut stderr = child.stderr.take().context("sidecar stderr missing")?;
@@ -418,16 +444,29 @@ impl RunningSidecar {
         Ok(Self {
             child,
             stdin: Some(stdin),
-            stdout_thread: Some(stdout_thread),
+            stdout_rx: Some(stdout_rx),
             stderr_thread: Some(stderr_thread),
         })
     }
 
-    fn finish(mut self, samples: &[f32], timeout: Duration) -> Result<String> {
+    /// Returns as soon as the sidecar closes stdout. Unix sidecars close it
+    /// right after writing the transcript, while GPU context teardown and
+    /// process exit take another ~100-170 ms; that tail is waited for in the
+    /// background and parked in `exiting`.
+    fn finish(
+        mut self,
+        samples: &[f32],
+        timeout: Duration,
+        exiting: &Mutex<Option<JoinHandle<()>>>,
+    ) -> Result<String> {
         let total_start = Instant::now();
         let mut stdin = self.stdin.take().context("sidecar stdin missing")?;
+        let stdout_rx = self
+            .stdout_rx
+            .take()
+            .context("sidecar stdout reader missing")?;
         let write_start = Instant::now();
-        let (status, write_result, timed_out) = std::thread::scope(|scope| -> Result<_> {
+        let (stdout_result, write_result) = std::thread::scope(|scope| -> Result<_> {
             let stdin_thread = scope.spawn(move || {
                 let result = write_samples_to_stdin(&mut stdin, samples);
                 // Dropping stdin closes the pipe → sidecar's read_to_end returns.
@@ -435,26 +474,22 @@ impl RunningSidecar {
                 result
             });
 
-            let status = self
-                .child
-                .wait_timeout(timeout)
-                .context("sidecar wait with timeout failed")?;
-            let timed_out = status.is_none();
-            let status = match status {
-                Some(status) => status,
-                None => {
+            let stdout_result = match stdout_rx.recv_timeout(timeout) {
+                Ok(result) => Some(result),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
                     tracing::error!("sidecar timed out after {:?}; killing process", timeout);
                     let _ = self.child.kill();
-                    self.child
-                        .wait()
-                        .context("sidecar wait after kill failed")?
+                    None
                 }
+                Err(mpsc::RecvTimeoutError::Disconnected) => Some(Err(std::io::Error::other(
+                    "sidecar stdout reader panicked",
+                ))),
             };
 
             let write_result = stdin_thread
                 .join()
                 .map_err(|_| anyhow::anyhow!("sidecar stdin writer panicked"))?;
-            Ok((status, write_result, timed_out))
+            Ok((stdout_result, write_result))
         })?;
         tracing::debug!(
             "sidecar stdin writer finished after {:?} for {} samples",
@@ -462,42 +497,47 @@ impl RunningSidecar {
             samples.len()
         );
 
-        if timed_out {
-            let stdout_text = self
-                .stdout_thread
-                .take()
-                .expect("sidecar stdout reader missing")
-                .join()
-                .ok()
-                .and_then(|result| result.ok())
-                .unwrap_or_default();
-            let stderr_text = self
-                .stderr_thread
-                .take()
-                .expect("sidecar stderr reader missing")
-                .join()
-                .unwrap_or_default();
+        let Some(stdout_result) = stdout_result else {
+            let _ = self.child.wait();
+            let stderr_text = self.take_stderr();
             anyhow::bail!(
-                "sidecar timed out after {:?}; stdout: {}; stderr: {}",
+                "sidecar timed out after {:?}; stderr: {}",
                 timeout,
-                stdout_text.trim(),
                 stderr_text.trim()
             );
+        };
+
+        if let (Ok(text), Ok(())) = (&stdout_result, &write_result) {
+            let text = text.trim().to_string();
+            if !text.is_empty() {
+                tracing::info!("transcription took {:?}", total_start.elapsed());
+                tracing::info!("sidecar phase=finished elapsed={:?}", total_start.elapsed());
+                let reaper = std::thread::spawn(move || self.reap());
+                if let Some(previous) = exiting.lock().unwrap().replace(reaper) {
+                    let _ = previous.join();
+                }
+                return Ok(text);
+            }
         }
 
-        let stdout_buf = self
-            .stdout_thread
-            .take()
-            .expect("sidecar stdout reader missing")
-            .join()
-            .map_err(|_| anyhow::anyhow!("sidecar stdout reader panicked"))?
-            .context("failed to read sidecar stdout")?;
-        let stderr_text = self
-            .stderr_thread
-            .take()
-            .expect("sidecar stderr reader missing")
-            .join()
-            .unwrap_or_default();
+        // No transcript: the exit status and stderr decide between a valid
+        // empty result (silence) and a failure, so wait for the process.
+        let remaining = timeout.saturating_sub(total_start.elapsed());
+        let status = match self
+            .child
+            .wait_timeout(remaining)
+            .context("sidecar wait with timeout failed")?
+        {
+            Some(status) => status,
+            None => {
+                tracing::error!("sidecar did not exit after closing stdout; killing process");
+                let _ = self.child.kill();
+                self.child
+                    .wait()
+                    .context("sidecar wait after kill failed")?
+            }
+        };
+        let stderr_text = self.take_stderr();
 
         if let Err(e) = write_result {
             anyhow::bail!(
@@ -506,6 +546,7 @@ impl RunningSidecar {
                 stderr_text.trim()
             );
         }
+        let stdout_buf = stdout_result.context("failed to read sidecar stdout")?;
         if !status.success() {
             anyhow::bail!(
                 "sidecar exited with {:?}; stderr: {}",
@@ -517,6 +558,31 @@ impl RunningSidecar {
         tracing::info!("transcription took {:?}", total_start.elapsed());
         tracing::info!("sidecar phase=finished elapsed={:?}", total_start.elapsed());
         Ok(stdout_buf.trim().to_string())
+    }
+
+    /// Wait for a sidecar whose transcript has already been delivered.
+    fn reap(mut self) {
+        let exit_start = Instant::now();
+        let status = self.child.wait();
+        let stderr_text = self.take_stderr();
+        match status {
+            Ok(status) if status.success() => {}
+            Ok(status) => tracing::warn!(
+                "sidecar exited with {:?} after returning a transcript; stderr: {}",
+                status.code(),
+                stderr_text.trim()
+            ),
+            Err(e) => tracing::warn!("sidecar wait after transcript failed: {}", e),
+        }
+        log_sidecar_diagnostics(&stderr_text);
+        tracing::info!("sidecar phase=exited after_stdout={:?}", exit_start.elapsed());
+    }
+
+    fn take_stderr(&mut self) -> String {
+        self.stderr_thread
+            .take()
+            .and_then(|thread| thread.join().ok())
+            .unwrap_or_default()
     }
 
     fn terminate(mut self, reason: &str) {
@@ -539,14 +605,8 @@ impl RunningSidecar {
                 error
             ),
         }
-        if let Some(stdout_thread) = self.stdout_thread.take() {
-            let _ = stdout_thread.join();
-        }
-        if let Some(stderr_thread) = self.stderr_thread.take() {
-            if let Ok(stderr_text) = stderr_thread.join() {
-                log_sidecar_diagnostics(&stderr_text);
-            }
-        }
+        drop(self.stdout_rx.take());
+        log_sidecar_diagnostics(&self.take_stderr());
         tracing::info!("CUDA prewarm phase=released reason={}", reason);
     }
 }
@@ -564,12 +624,8 @@ impl Drop for RunningSidecar {
                 let _ = self.child.wait();
             }
         }
-        if let Some(stdout_thread) = self.stdout_thread.take() {
-            let _ = stdout_thread.join();
-        }
-        if let Some(stderr_thread) = self.stderr_thread.take() {
-            let _ = stderr_thread.join();
-        }
+        drop(self.stdout_rx.take());
+        let _ = self.take_stderr();
     }
 }
 
@@ -682,6 +738,67 @@ mod tests {
 
         let expected = [1.0f32.to_le_bytes(), (-2.5f32).to_le_bytes()].concat();
         assert_eq!(out, expected);
+    }
+
+    /// Fake sidecars are written once, before any test spawns one: writing an
+    /// executable while a parallel test forks makes exec fail with ETXTBSY.
+    #[cfg(unix)]
+    fn fake_sidecar(name: &str) -> SidecarSpec {
+        use std::os::unix::fs::PermissionsExt;
+        static SCRIPTS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let dir = SCRIPTS.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("flov-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, body) in [
+                // Mirrors a GPU sidecar: text, stdout closed, then slow teardown.
+                ("eof", "printf ' text '\nexec 1>&-\nsleep 1"),
+                ("fail", "echo 'model broken' >&2\nexit 1"),
+            ] {
+                let path = dir.join(name);
+                std::fs::write(&path, format!("#!/bin/sh\ncat >/dev/null\n{body}\n")).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            dir
+        });
+        SidecarSpec {
+            backend: "cpu".into(),
+            sidecar: dir.join(name),
+            model_path: PathBuf::from("unused"),
+            language: "ru".into(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_returns_transcript_on_stdout_eof_before_exit() {
+        let spec = fake_sidecar("eof");
+        let exiting = Mutex::new(None);
+        let start = Instant::now();
+
+        let text = RunningSidecar::spawn(&spec, false, false)
+            .unwrap()
+            .finish(&[0.0; 160], Duration::from_secs(10), &exiting)
+            .unwrap();
+
+        assert_eq!(text, "text");
+        assert!(start.elapsed() < Duration::from_millis(700), "{:?}", start.elapsed());
+        exiting.lock().unwrap().take().unwrap().join().unwrap();
+        assert!(start.elapsed() >= Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_reports_failure_without_transcript() {
+        let spec = fake_sidecar("fail");
+        let exiting = Mutex::new(None);
+
+        let error = RunningSidecar::spawn(&spec, false, false)
+            .unwrap()
+            .finish(&[0.0; 160], Duration::from_secs(10), &exiting)
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("model broken"), "{error:#}");
+        assert!(exiting.lock().unwrap().is_none());
     }
 
     #[test]

@@ -232,18 +232,80 @@ mod linux_impl {
         // Wayland round-trip, so the compositor has accepted this clipboard
         // owner. Do not add a delay here: it only increases release-to-paste
         // latency and does not make the selection any more ready.
+        let layout = hyprland_main_layout();
         match Command::new("wtype")
             .arg("-M")
-            .arg("ctrl")
+            .arg("shift")
             .arg("-k")
-            .arg("v")
+            .arg("Insert")
             .arg("-m")
-            .arg("ctrl")
+            .arg("shift")
             .status()
         {
             Ok(status) if status.success() => {}
             Ok(status) => tracing::error!("wtype exited with: {}", status),
             Err(e) => tracing::error!("wtype failed: {} (install wtype)", e),
+        }
+        if let Some((name, index)) = layout {
+            restore_hyprland_layout(&name, index);
+        }
+    }
+
+    /// Name and layout index of the keyboard Hyprland currently treats as
+    /// the seat keyboard, when its active layout is not the first one.
+    ///
+    /// wtype is a virtual keyboard with its own single-group keymap. When it
+    /// disconnects, Hyprland (0.56) switches the seat to another keyboard and
+    /// later back to the real one, sending only `wl_keyboard.keymap` and no
+    /// `modifiers` event. The client rebuilds its xkb state at group 0, so the
+    /// next letters come out in the first layout while Hyprland and the bar
+    /// still report the second one. It lasts until a modifier is pressed on
+    /// the real keyboard.
+    fn hyprland_main_layout() -> Option<(String, u64)> {
+        std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
+        let output = Command::new("hyprctl").args(["-j", "devices"]).output();
+        let output = match output {
+            Ok(output) if output.status.success() => output.stdout,
+            Ok(output) => {
+                tracing::warn!("hyprctl devices exited with: {}", output.status);
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!("hyprctl devices failed: {}", e);
+                return None;
+            }
+        };
+        let devices: serde_json::Value = match serde_json::from_slice(&output) {
+            Ok(devices) => devices,
+            Err(e) => {
+                tracing::warn!("hyprctl devices returned invalid JSON: {}", e);
+                return None;
+            }
+        };
+        let main = devices["keyboards"]
+            .as_array()?
+            .iter()
+            .find(|keyboard| keyboard["main"].as_bool() == Some(true))?;
+        let index = main["active_layout_index"].as_u64()?;
+        if index == 0 {
+            return None;
+        }
+        Some((main["name"].as_str()?.to_string(), index))
+    }
+
+    /// Re-send the layout group to the focused client. Setting the same index
+    /// is a no-op in Hyprland, so step through layout 0 and back: the second
+    /// change emits a `modifiers` event with the right group.
+    fn restore_hyprland_layout(name: &str, index: u64) {
+        let batch = format!("switchxkblayout {name} 0 ; switchxkblayout {name} {index}");
+        match Command::new("hyprctl").arg("--batch").arg(&batch).output() {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => tracing::warn!(
+                "hyprctl layout restore exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim()
+            ),
+            Err(e) => tracing::warn!("hyprctl layout restore failed: {}", e),
         }
     }
 

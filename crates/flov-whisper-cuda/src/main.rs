@@ -159,6 +159,8 @@ fn run() -> Result<()> {
     out.write_all(text.trim().as_bytes())
         .context("failed to write stdout")?;
     out.flush().ok();
+    drop(out);
+    close_stdout();
     log_phase("total", total_start.elapsed());
     Ok(())
 }
@@ -287,3 +289,16 @@ mod tests {
         assert_eq!(auto_audio_context(usize::MAX), 1500);
     }
 }
+
+/// Close stdout as soon as the transcript is written: the app returns the
+/// text on EOF instead of waiting for model teardown and process exit
+/// (~100-170 ms with a GPU context). Nothing writes to stdout afterwards.
+#[cfg(unix)]
+fn close_stdout() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: fd 1 is the process stdout and is not used after this call.
+    drop(unsafe { OwnedFd::from_raw_fd(1) });
+}
+
+#[cfg(not(unix))]
+fn close_stdout() {}
