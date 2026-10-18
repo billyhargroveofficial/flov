@@ -189,17 +189,29 @@ binding is harmless.
 ## Text insertion
 
 After transcription Flov writes UTF-8 text to the Wayland clipboard and
-sends `Ctrl+V` through `wtype`. If recognition works but nothing is inserted,
-check:
+sends `Shift+Insert` through `wtype`. Unlike `Ctrl+V`, it pastes in terminals
+too. Some terminals bind `Shift+Insert` to the primary selection instead of
+the clipboard (Ghostty and foot by default); rebind it there, for Ghostty:
+`keybind = shift+insert=paste_from_clipboard`. If recognition works but
+nothing is inserted, check:
 
 ```bash
 command -v wl-copy wtype
 echo test | wl-copy
-wtype -M ctrl -k v -m ctrl
+wtype -M shift -k Insert -m shift
 ```
 
 Some security-sensitive clients deliberately reject virtual-keyboard input;
 the transcript still remains in the clipboard in that case.
+
+`wtype` is a virtual keyboard with its own single-layout keymap. When it
+disconnects, Hyprland switches the seat back to the real keyboard by sending
+only a new keymap, without the layout group, so with `kb_layout = us,ru` on
+`ru` the next letters came out in `us` while the bar still showed `ru`
+(hyprwm/Hyprland#6589). On Hyprland Flov therefore re-applies the active
+layout of the main keyboard after each paste
+(`hyprctl switchxkblayout <kbd> 0`, then back), which re-sends the group. The
+bar may flicker for a few milliseconds.
 
 ## HTTP service
 
