@@ -1187,12 +1187,20 @@ mod linux_impl {
             .all(|alternatives| alternatives.iter().any(|key| shared.is_held(*key)));
         drop(shared);
         if modifiers_held {
+            let Some(state) = HOOK_STATE.get() else {
+                return;
+            };
+            // A recording started through the control API (compositor bind,
+            // mouse toggle) is not owned by the evdev trigger. Claiming it
+            // here would make the trigger release stop that recording, so a
+            // stray RCtrl+key cut dictation short.
+            if state.active_mode.load(Ordering::SeqCst) != MODE_IDLE {
+                return;
+            }
             TRIGGER_HELD.store(true, Ordering::SeqCst);
             ACTIVE_TRIGGER.store(key.code(), Ordering::SeqCst);
-            if let Some(state) = HOOK_STATE.get() {
-                tracing::info!("Hotkey: {} (transcribe)", combo.label);
-                state.active_mode.store(MODE_TRANSCRIBE, Ordering::SeqCst);
-            }
+            tracing::info!("Hotkey: {} (transcribe)", combo.label);
+            state.active_mode.store(MODE_TRANSCRIBE, Ordering::SeqCst);
         }
     }
 
@@ -1217,6 +1225,31 @@ mod linux_impl {
 
             assert!(combo.required.is_empty());
             assert_eq!(combo.triggers, vec![Key::KEY_RIGHTCTRL]);
+        }
+
+        // The only test touching the hook globals, so it cannot race others.
+        #[test]
+        fn trigger_owns_only_the_recording_it_started() {
+            let state = HotkeyState::new();
+            let mode = state.active_mode.clone();
+            let _ = HOOK_STATE.set(state);
+            *LINUX_COMBO.write().unwrap() = LinuxCombo::from_combo("RCtrl");
+            let pressed = Mutex::new(PressedKeys::default());
+            let mut local = HashSet::new();
+            let mut tap = |value| handle_key_event(Key::KEY_RIGHTCTRL, value, &mut local, &pressed);
+
+            // Recording started by the control API: a trigger tap leaves it running.
+            mode.store(MODE_TRANSCRIBE, Ordering::SeqCst);
+            tap(1);
+            tap(0);
+            assert_eq!(mode.load(Ordering::SeqCst), MODE_TRANSCRIBE);
+
+            // Idle: the trigger is still push-to-talk.
+            mode.store(MODE_IDLE, Ordering::SeqCst);
+            tap(1);
+            assert_eq!(mode.load(Ordering::SeqCst), MODE_TRANSCRIBE);
+            tap(0);
+            assert_eq!(mode.load(Ordering::SeqCst), MODE_IDLE);
         }
     }
 }
