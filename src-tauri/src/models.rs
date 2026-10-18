@@ -39,10 +39,10 @@ pub struct CatalogEntry {
 // (rounded to bytes). They're used only for UI/UX (progress bars, "do you
 // have free disk?"); the actual download writes whatever bytes arrive.
 //
-// Curated to the 5 models that actually carry their weight: smaller variants
-// for fast/CPU runs, large-v3-turbo as the daily driver. Quantized + older
-// `large` revisions were removed because turbo strictly dominates them on a
-// modern GPU and the picker stayed cluttered.
+// Curated to the models that actually carry their weight: smaller variants
+// for fast/CPU runs, large-v3-turbo (f16 or q8_0) as the daily driver. Older
+// `large` revisions and their quantized builds were removed because turbo
+// strictly dominates them on a modern GPU and the picker stayed cluttered.
 const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         id: "tiny",
@@ -88,6 +88,19 @@ const CATALOG: &[CatalogEntry] = &[
         size_bytes: 1_620_000_000,
         languages: "multi",
         notes: "Quality close to v3, ~6× faster decoder. Default.",
+    },
+    // Measured on RTX 4050 Laptop / CUDA against the f16 turbo on 45 Russian
+    // speech clips (2-28 s, three LibriVox readers): 4 of 816 words differ,
+    // in both directions; inference ~17% faster, model load ~150-200 ms
+    // faster, which is the wait on phrases shorter than the load.
+    CatalogEntry {
+        id: "large-v3-turbo-q8_0",
+        family: "whisper",
+        label: "Large v3 Turbo Q8",
+        filename: "ggml-large-v3-turbo-q8_0.bin",
+        size_bytes: 874_188_075,
+        languages: "multi",
+        notes: "8-bit Turbo: same quality on tests, faster load and inference.",
     },
 ];
 
